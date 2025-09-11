@@ -1,0 +1,11 @@
+﻿  dllmain.cpp
+ClipboardVoice.def : warning LNK4222: no debería asignarse un ordinal al símbolo 'DllGetClassObject' exportado
+ClipboardVoice.def : warning LNK4222: no debería asignarse un ordinal al símbolo 'DllCanUnloadNow' exportado
+ClipboardVoice.def : warning LNK4222: no debería asignarse un ordinal al símbolo 'DllRegisterServer' exportado
+ClipboardVoice.def : warning LNK4222: no debería asignarse un ordinal al símbolo 'DllUnregisterServer' exportado
+     Creando biblioteca C:\Users\ogome\clipsapi\ClipboardVoice\x64\Release\ClipboardVoice.lib y objeto C:\Users\ogome\clipsapi\ClipboardVoice\x64\Release\ClipboardVoice.exp
+  Generando código
+  Previous IPDB and IOBJ mismatch, fall back to full compilation.
+  All 488 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  Generación de código finalizada
+  ClipboardVoice.vcxproj -> C:\Users\ogome\clipsapi\ClipboardVoice\x64\Release\ClipboardVoice.dll

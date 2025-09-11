@@ -1,0 +1,16 @@
+HKCR
+{
+    NoRemove CLSID
+    {
+        ForceRemove {F4ABF2E3-9F21-4B8C-B410-4A0A9E5C5BD3} = s 'ClipboardVoiceEngine Class'
+        {
+            InprocServer32 = s '%MODULE%'
+            {
+                val ThreadingModel = s 'Both'
+            }
+            ProgID = s 'ClipboardVoice.Engine'
+            VersionIndependentProgID = s 'ClipboardVoice.Engine'
+        }
+    }
+}
+

@@ -1,0 +1,12 @@
+#include "resource.h"
+
+#define APSTUDIO_READONLY_SYMBOLS
+#include <windows.h>
+#undef APSTUDIO_READONLY_SYMBOLS
+
+IDR_CLIPBOARDVOICEENGINE     REGISTRY    "ClipboardVoiceEngine.rgs"
+
+STRINGTABLE
+BEGIN
+    IDS_PROJNAME, "Clipboard Voice"
+END

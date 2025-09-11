@@ -1,0 +1,13 @@
+import "oaidl.idl";
+import "ocidl.idl";
+
+[uuid(6E668799-5E5A-4F00-A0E8-50A84B9A5232), version(1.0)]
+library ClipboardVoiceLib
+{
+    [uuid(F4ABF2E3-9F21-4B8C-B410-4A0A9E5C5BD3)]
+    coclass ClipboardVoiceEngine
+    {
+        interface IUnknown;
+    };
+};
+
