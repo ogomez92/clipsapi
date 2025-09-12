@@ -53,9 +53,14 @@ STDMETHODIMP CClipboardVoiceEngine::Speak(DWORD /*dwFlags*/, REFGUID /*rguidForm
     const WAVEFORMATEX* fmt = pWaveFormatEx ? pWaveFormatEx : &m_wfx;
 
     // Signal start of stream
-    SPEVENT startEvt = {};
-    startEvt.eEventId = SPEI_START_INPUT_STREAM;
-    pOutputSite->AddEvents(&startEvt, 1);
+    {
+        SPEVENT startEvt = {};
+        startEvt.eEventId = SPEI_START_INPUT_STREAM;
+        startEvt.elParamType = SPET_LPARAM_IS_UNDEFINED;
+        startEvt.ulStreamNum = 0;
+        startEvt.ullAudioStreamOffset = 0;
+        pOutputSite->AddEvents(&startEvt, 1);
+    }
 
     // Build the text to place on the clipboard
     std::wstring text = BuildTextFromFrags(pTextFragList);
@@ -63,13 +68,37 @@ STDMETHODIMP CClipboardVoiceEngine::Speak(DWORD /*dwFlags*/, REFGUID /*rguidForm
     // Try to copy to clipboard (best-effort)
     CopyTextToClipboard(text);
 
-    // Write a tiny slice of silence so clients that expect audio are satisfied
-    WriteTinySilence(pOutputSite, fmt, 0.30); // 300ms
+    // Emit progress events if requested and trickle out a bit of audio to advance offsets
+    size_t audioBytesWritten = 0;
+
+    // 1000 ms total output target; apportion ~20 ms per word as a default pacing
+    const double totalMs = 1000.0;
+    const double defaultMsPerWord = 20.0;
+    const ULONGLONG forcedInterest = SPFEI(SPEI_WORD_BOUNDARY) | SPFEI(SPEI_SENTENCE_BOUNDARY);
+    EmitWordAndSentenceEvents(text, pOutputSite, fmt, audioBytesWritten, defaultMsPerWord, forcedInterest);
+
+    // Ensure at least 300ms of audio total
+    double remainingMs = 0.0;
+    if (fmt->nAvgBytesPerSec)
+    {
+        double producedMs = (double)audioBytesWritten * 1000.0 / (double)fmt->nAvgBytesPerSec;
+        if (producedMs < totalMs) remainingMs = totalMs - producedMs;
+    }
+    if (remainingMs > 0.0)
+    {
+        WriteTinySilence(pOutputSite, fmt, remainingMs / 1000.0);
+        audioBytesWritten += (size_t)(fmt->nAvgBytesPerSec * (remainingMs / 1000.0));
+    }
 
     // End of stream event
-    SPEVENT endEvt = {};
-    endEvt.eEventId = SPEI_END_INPUT_STREAM;
-    pOutputSite->AddEvents(&endEvt, 1);
+    {
+        SPEVENT endEvt = {};
+        endEvt.eEventId = SPEI_END_INPUT_STREAM;
+        endEvt.elParamType = SPET_LPARAM_IS_UNDEFINED;
+        endEvt.ulStreamNum = 0;
+        endEvt.ullAudioStreamOffset = audioBytesWritten;
+        pOutputSite->AddEvents(&endEvt, 1);
+    }
 
     return S_OK;
 }
@@ -157,6 +186,99 @@ HRESULT CClipboardVoiceEngine::WriteTinySilence(ISpTTSEngineSite* pSite, const W
     std::vector<BYTE> zero(bytes, 0);
     ULONG written = 0;
     return pSite->Write(zero.data(), static_cast<ULONG>(zero.size()), &written);
+}
+
+bool CClipboardVoiceEngine::IsWhitespace(wchar_t ch)
+{
+    return ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n' || ch == 0x00A0;
+}
+
+void CClipboardVoiceEngine::AddEvent(ISpTTSEngineSite* pSite, SPEVENTENUM evtId,
+                         ULONGLONG audioOffset, ULONG wParam, LONG lParam)
+{
+    SPEVENT evt = {};
+    evt.eEventId = evtId;
+    evt.elParamType = SPET_LPARAM_IS_UNDEFINED;
+    evt.ulStreamNum = 0;
+    evt.ullAudioStreamOffset = audioOffset;
+    evt.wParam = wParam;
+    evt.lParam = lParam;
+    pSite->AddEvents(&evt, 1);
+}
+
+void CClipboardVoiceEngine::EmitWordAndSentenceEvents(const std::wstring& text,
+                                          ISpTTSEngineSite* pSite,
+                                          const WAVEFORMATEX* pFmt,
+                                          size_t& audioBytesWritten,
+                                          double msPerWord,
+                                          ULONGLONG interestMask)
+{
+    if (!pSite || !pFmt || !pFmt->nAvgBytesPerSec) return;
+
+    const bool wantWord = (interestMask & SPFEI(SPEI_WORD_BOUNDARY)) != 0;
+    const bool wantSent = (interestMask & SPFEI(SPEI_SENTENCE_BOUNDARY)) != 0;
+
+    const size_t bytesPerMs = (size_t)((double)pFmt->nAvgBytesPerSec / 1000.0);
+    const size_t chunkBytes = (size_t)(bytesPerMs * (msPerWord > 0.0 ? msPerWord : 10.0));
+
+    size_t i = 0;
+    while (i < text.size())
+    {
+        if (pSite->GetActions() & SPVES_ABORT) {
+            return; // stop emitting
+        }
+
+        // Skip leading whitespace
+        while (i < text.size() && IsWhitespace(text[i]))
+        {
+            if (wantWord)
+            {
+                // Treat whitespace as advancing time slightly
+                ULONG dummyWritten = 0;
+                if (chunkBytes)
+                {
+                    std::vector<BYTE> z(chunkBytes, 0);
+                    pSite->Write(z.data(), (ULONG)z.size(), &dummyWritten);
+                    audioBytesWritten += dummyWritten;
+                }
+            }
+            ++i;
+        }
+        if (i >= text.size()) break;
+
+        // Start of a word
+        size_t start = i;
+        while (i < text.size() && !IsWhitespace(text[i])) ++i;
+        size_t len = i - start;
+
+        // Emit word boundary
+        if (wantWord)
+        {
+            AddEvent(pSite, SPEI_WORD_BOUNDARY, audioBytesWritten, (ULONG)start, (LONG)len);
+        }
+
+        // Advance audio a bit to simulate progress
+        if (chunkBytes)
+        {
+            ULONG wrote = 0;
+            std::vector<BYTE> z(chunkBytes, 0);
+            pSite->Write(z.data(), (ULONG)z.size(), &wrote);
+            audioBytesWritten += wrote;
+        }
+
+        // Sentence boundary detection: on punctuation . ! ? followed by space or end
+        if (wantSent && len > 0)
+        {
+            wchar_t last = text[start + len - 1];
+            if (last == L'.' || last == L'!' || last == L'?')
+            {
+                // Find sentence start (very rough): previous whitespace
+                size_t sBeg = start;
+                while (sBeg > 0 && !IsWhitespace(text[sBeg - 1])) --sBeg;
+                AddEvent(pSite, SPEI_SENTENCE_BOUNDARY, audioBytesWritten, (ULONG)sBeg, (LONG)(i - sBeg));
+            }
+        }
+    }
 }
 
 // ---------- Registration of SAPI token ----------

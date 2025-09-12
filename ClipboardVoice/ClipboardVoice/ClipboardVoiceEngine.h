@@ -51,6 +51,17 @@ private:
     static bool CopyTextToClipboard(const std::wstring& text);
     static std::wstring BuildTextFromFrags(const SPVTEXTFRAG* pList);
     HRESULT WriteTinySilence(ISpTTSEngineSite* pSite, const WAVEFORMATEX* pFmt, double seconds);
+
+    // Progress helpers
+    static bool IsWhitespace(wchar_t ch);
+    static void EmitWordAndSentenceEvents(const std::wstring& text,
+                                          ISpTTSEngineSite* pSite,
+                                          const WAVEFORMATEX* pFmt,
+                                          size_t& audioBytesWritten,
+                                          double msPerWord,
+                                          ULONGLONG interestMask);
+    static void AddEvent(ISpTTSEngineSite* pSite, SPEVENTENUM evtId,
+                         ULONGLONG audioOffset, ULONG wParam, LONG lParam);
 };
 
 // Helpers used by DllRegisterServer
