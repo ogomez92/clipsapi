@@ -45,10 +45,13 @@ public:
 private:
     CComPtr<ISpObjectToken> m_cpToken;
     WAVEFORMATEX m_wfx{};
-
-    static WAVEFORMATEX* CreatePcmWaveFormat(WORD samplesPerSec);
+public:
+    // Exposed so the background worker can use them
     static void SleepMs(DWORD ms);
     static bool CopyTextToClipboard(const std::wstring& text);
+
+private:
+    static WAVEFORMATEX* CreatePcmWaveFormat(WORD samplesPerSec);
     static std::wstring BuildTextFromFrags(const SPVTEXTFRAG* pList);
     HRESULT WriteTinySilence(ISpTTSEngineSite* pSite, const WAVEFORMATEX* pFmt, double seconds);
 
@@ -62,6 +65,9 @@ private:
                                           ULONGLONG interestMask);
     static void AddEvent(ISpTTSEngineSite* pSite, SPEVENTENUM evtId,
                          ULONGLONG audioOffset, ULONG wParam, LONG lParam);
+
+    // Async clipboard queue so fast inputs are not lost when the clipboard is busy
+    static void EnqueueTextAsync(const std::wstring& text);
 };
 
 // Helpers used by DllRegisterServer

@@ -1,7 +1,73 @@
 #include "ClipboardVoiceEngine.h"
 #include <strsafe.h>
+#include <deque>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <atomic>
 
 using std::wstring;
+
+namespace {
+    std::mutex g_qMutex;
+    std::condition_variable g_qCv;
+    std::deque<std::wstring> g_queue;
+    std::atomic<bool> g_workerStarted{ false };
+    std::atomic<bool> g_stopWorker{ false };
+    std::thread g_worker;
+
+    void WorkerProc()
+    {
+        for(;;)
+        {
+            std::wstring item;
+            {
+                std::unique_lock<std::mutex> lock(g_qMutex);
+                g_qCv.wait(lock, [] { return !g_queue.empty() || g_stopWorker.load(); });
+                if (g_stopWorker.load()) break;
+                item = std::move(g_queue.front());
+                g_queue.pop_front();
+            }
+
+            // Try to copy; retry until success or shutdown to avoid losing items
+            for (;;)
+            {
+                if (CClipboardVoiceEngine::CopyTextToClipboard(item))
+                    break;
+                if (g_stopWorker.load())
+                    break;
+                CClipboardVoiceEngine::SleepMs(50);
+            }
+        }
+    }
+
+    void StartWorkerIfNeeded()
+    {
+        bool expected = false;
+        if (g_workerStarted.compare_exchange_strong(expected, true))
+        {
+            g_stopWorker.store(false);
+            g_worker = std::thread(WorkerProc);
+        }
+    }
+
+    void StopWorker()
+    {
+        if (!g_workerStarted.load()) return;
+        g_stopWorker.store(true);
+        g_qCv.notify_all();
+        if (g_worker.joinable())
+        {
+            // Wait briefly to avoid deadlocks during shutdown
+            g_worker.join();
+        }
+        g_workerStarted.store(false);
+    }
+}
+
+// Expose start/stop for DllMain
+void StartClipboardWorker() { StartWorkerIfNeeded(); }
+void StopClipboardWorker() { StopWorker(); }
 
 CClipboardVoiceEngine::CClipboardVoiceEngine()
 {
@@ -65,8 +131,8 @@ STDMETHODIMP CClipboardVoiceEngine::Speak(DWORD /*dwFlags*/, REFGUID /*rguidForm
     // Build the text to place on the clipboard
     std::wstring text = BuildTextFromFrags(pTextFragList);
 
-    // Try to copy to clipboard (best-effort)
-    CopyTextToClipboard(text);
+    // Queue clipboard write asynchronously to avoid losing inputs when clipboard is busy
+    EnqueueTextAsync(text);
 
     // Emit progress events if requested and trickle out a bit of audio to advance offsets
     size_t audioBytesWritten = 0;
@@ -159,6 +225,7 @@ bool CClipboardVoiceEngine::CopyTextToClipboard(const std::wstring& text)
     return false;
 }
 
+
 // static
 std::wstring CClipboardVoiceEngine::BuildTextFromFrags(const SPVTEXTFRAG* pList)
 {
@@ -204,6 +271,16 @@ void CClipboardVoiceEngine::AddEvent(ISpTTSEngineSite* pSite, SPEVENTENUM evtId,
     evt.wParam = wParam;
     evt.lParam = lParam;
     pSite->AddEvents(&evt, 1);
+}
+
+void CClipboardVoiceEngine::EnqueueTextAsync(const std::wstring& text)
+{
+    StartWorkerIfNeeded();
+    {
+        std::lock_guard<std::mutex> lock(g_qMutex);
+        g_queue.emplace_back(text);
+    }
+    g_qCv.notify_one();
 }
 
 void CClipboardVoiceEngine::EmitWordAndSentenceEvents(const std::wstring& text,

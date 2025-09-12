@@ -10,8 +10,17 @@ CClipboardVoiceModule _AtlModule;
 
 OBJECT_ENTRY_AUTO(CLSID_ClipboardVoiceEngine, CClipboardVoiceEngine)
 
+// Start/stop the clipboard worker from the engine unit
+void StartClipboardWorker();
+void StopClipboardWorker();
+
 extern "C" BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpReserved)
 {
+    if (dwReason == DLL_PROCESS_DETACH)
+    {
+        // Ensure background worker exits before the module unloads
+        StopClipboardWorker();
+    }
     return _AtlModule.DllMain(dwReason, lpReserved);
 }
 
