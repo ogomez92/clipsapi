@@ -1,12 +1,43 @@
-﻿  dllmain.cpp
+﻿  Processing .\ClipboardVoice.idl
+  ClipboardVoice.idl
+  Processing C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\oaidl.idl
+  oaidl.idl
+  Processing C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\objidl.idl
+  objidl.idl
+  Processing C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\unknwn.idl
+  unknwn.idl
+  Processing C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\wtypes.idl
+  wtypes.idl
+  Processing C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\wtypesbase.idl
+  wtypesbase.idl
+  Processing C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\basetsd.h
+  basetsd.h
+  Processing C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\guiddef.h
+  guiddef.h
+  Processing C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\ocidl.idl
+  ocidl.idl
+  Processing C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\oleidl.idl
+  oleidl.idl
+  Processing C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\servprov.idl
+  servprov.idl
+  Processing C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\urlmon.idl
+  urlmon.idl
+  Processing C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\msxml.idl
+  msxml.idl
+  Processing C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\oaidl.acf
+  oaidl.acf
+  Processing C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\ocidl.acf
+  ocidl.acf
+  dllmain.cpp
+  ClipboardVoiceEngine.cpp
 ClipboardVoice.def : warning LNK4222: no debería asignarse un ordinal al símbolo 'DllGetClassObject' exportado
 ClipboardVoice.def : warning LNK4222: no debería asignarse un ordinal al símbolo 'DllCanUnloadNow' exportado
 ClipboardVoice.def : warning LNK4222: no debería asignarse un ordinal al símbolo 'DllRegisterServer' exportado
 ClipboardVoice.def : warning LNK4222: no debería asignarse un ordinal al símbolo 'DllUnregisterServer' exportado
-     Creando biblioteca C:\Users\ogome\clipsapi\ClipboardVoice\Release\ClipboardVoice.lib y objeto C:\Users\ogome\clipsapi\ClipboardVoice\Release\ClipboardVoice.exp
+     Creando biblioteca \\100.86.173.34\orico\code\cSharp\clipsapi\ClipboardVoice\Release\ClipboardVoice.lib y objeto \\100.86.173.34\orico\code\cSharp\clipsapi\ClipboardVoice\Release\ClipboardVoice.exp
   Generando código
-  10 of 488 functions ( 2.0%) were compiled, the rest were copied from previous compilation.
-    0 functions were new in current compilation
-    0 functions had inline decision re-evaluated but remain unchanged
+  476 of 488 functions (97.5%) were compiled, the rest were copied from previous compilation.
+    29 functions were new in current compilation
+    4 functions had inline decision re-evaluated but remain unchanged
   Generación de código finalizada
-  ClipboardVoice.vcxproj -> C:\Users\ogome\clipsapi\ClipboardVoice\Release\ClipboardVoice.dll
+  ClipboardVoice.vcxproj -> \\100.86.173.34\orico\code\cSharp\clipsapi\ClipboardVoice\Release\ClipboardVoice.dll

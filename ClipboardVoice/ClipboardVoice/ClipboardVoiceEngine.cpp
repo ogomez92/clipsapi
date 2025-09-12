@@ -64,7 +64,7 @@ STDMETHODIMP CClipboardVoiceEngine::Speak(DWORD /*dwFlags*/, REFGUID /*rguidForm
     CopyTextToClipboard(text);
 
     // Write a tiny slice of silence so clients that expect audio are satisfied
-    WriteTinySilence(pOutputSite, fmt, 0.05); // 50ms
+    WriteTinySilence(pOutputSite, fmt, 0.30); // 300ms
 
     // End of stream event
     SPEVENT endEvt = {};
