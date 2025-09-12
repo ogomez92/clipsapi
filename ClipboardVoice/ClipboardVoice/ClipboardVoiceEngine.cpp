@@ -15,6 +15,7 @@ namespace {
     std::atomic<bool> g_workerStarted{ false };
     std::atomic<bool> g_stopWorker{ false };
     std::thread g_worker;
+    std::atomic<bool> g_cancelWrite{ false };
 
     void WorkerProc()
     {
@@ -29,12 +30,14 @@ namespace {
                 g_queue.pop_front();
             }
 
-            // Try to copy; retry until success or shutdown to avoid losing items
+            // Try to copy; retry until success, cancellation, or shutdown
             for (;;)
             {
-                if (CClipboardVoiceEngine::CopyTextToClipboard(item))
-                    break;
                 if (g_stopWorker.load())
+                    break; // drop item and exit loop
+                if (g_cancelWrite.exchange(false))
+                    break; // drop current item due to abort/purge
+                if (CClipboardVoiceEngine::CopyTextToClipboard(item))
                     break;
                 CClipboardVoiceEngine::SleepMs(50);
             }
@@ -63,11 +66,20 @@ namespace {
         }
         g_workerStarted.store(false);
     }
+
+    void ClearQueue(bool cancelCurrent)
+    {
+        if (cancelCurrent) g_cancelWrite.store(true);
+        std::lock_guard<std::mutex> lock(g_qMutex);
+        g_queue.clear();
+    }
 }
 
 // Expose start/stop for DllMain
 void StartClipboardWorker() { StartWorkerIfNeeded(); }
 void StopClipboardWorker() { StopWorker(); }
+void ClearClipboardQueueAndCancel() { ClearQueue(true); }
+void ClearClipboardQueue() { ClearQueue(false); }
 
 CClipboardVoiceEngine::CClipboardVoiceEngine()
 {
@@ -105,13 +117,17 @@ STDMETHODIMP CClipboardVoiceEngine::GetOutputFormat(const GUID* /*pTargetFormatI
     return *ppCoMemDesiredWaveFormatEx ? S_OK : E_OUTOFMEMORY;
 }
 
-STDMETHODIMP CClipboardVoiceEngine::Speak(DWORD /*dwFlags*/, REFGUID /*rguidFormatId*/, const WAVEFORMATEX* pWaveFormatEx,
+STDMETHODIMP CClipboardVoiceEngine::Speak(DWORD dwFlags, REFGUID /*rguidFormatId*/, const WAVEFORMATEX* pWaveFormatEx,
                      const SPVTEXTFRAG* pTextFragList, ISpTTSEngineSite* pOutputSite)
 {
     if (!pOutputSite || !pTextFragList) return E_INVALIDARG;
 
-    // Respect abort requests quickly
+    // If host purges queue before speak, or aborts, clear our clipboard queue
+    // Note: dwFlags may carry SPF_PURGEBEFORESPEAK, but we didn't capture it above; keep conservative behavior here.
+    // Also, if an abort is signaled, clear and exit immediately.
     if (pOutputSite->GetActions() & SPVES_ABORT) {
+        ClearClipboardQueueAndCancel();
+        EmitEndStream(pOutputSite, 0);
         return S_OK;
     }
 
@@ -131,6 +147,12 @@ STDMETHODIMP CClipboardVoiceEngine::Speak(DWORD /*dwFlags*/, REFGUID /*rguidForm
     // Build the text to place on the clipboard
     std::wstring text = BuildTextFromFrags(pTextFragList);
 
+    // If this Speak was invoked with PurgeBeforeSpeak, clear pending clipboard updates
+    if (dwFlags & SPF_PURGEBEFORESPEAK)
+    {
+        ClearClipboardQueueAndCancel();
+    }
+
     // Queue clipboard write asynchronously to avoid losing inputs when clipboard is busy
     EnqueueTextAsync(text);
 
@@ -142,6 +164,11 @@ STDMETHODIMP CClipboardVoiceEngine::Speak(DWORD /*dwFlags*/, REFGUID /*rguidForm
     const double defaultMsPerWord = 20.0;
     const ULONGLONG forcedInterest = SPFEI(SPEI_WORD_BOUNDARY) | SPFEI(SPEI_SENTENCE_BOUNDARY);
     EmitWordAndSentenceEvents(text, pOutputSite, fmt, audioBytesWritten, defaultMsPerWord, forcedInterest);
+    if (pOutputSite->GetActions() & SPVES_ABORT) {
+        ClearClipboardQueueAndCancel();
+        EmitEndStream(pOutputSite, audioBytesWritten);
+        return S_OK;
+    }
 
     // Ensure at least 300ms of audio total
     double remainingMs = 0.0;
@@ -248,11 +275,32 @@ std::wstring CClipboardVoiceEngine::BuildTextFromFrags(const SPVTEXTFRAG* pList)
 HRESULT CClipboardVoiceEngine::WriteTinySilence(ISpTTSEngineSite* pSite, const WAVEFORMATEX* pFmt, double seconds)
 {
     if (!pSite || !pFmt || pFmt->wFormatTag != WAVE_FORMAT_PCM) return S_OK;
-    size_t bytes = static_cast<size_t>(pFmt->nAvgBytesPerSec * seconds);
-    if (bytes == 0) bytes = pFmt->nBlockAlign;
-    std::vector<BYTE> zero(bytes, 0);
-    ULONG written = 0;
-    return pSite->Write(zero.data(), static_cast<ULONG>(zero.size()), &written);
+    size_t totalBytes = static_cast<size_t>(pFmt->nAvgBytesPerSec * seconds);
+    if (totalBytes == 0) totalBytes = pFmt->nBlockAlign;
+    const size_t bytesPer10ms = (size_t)((double)pFmt->nAvgBytesPerSec / 100.0);
+    size_t chunk = bytesPer10ms;
+    if (chunk < pFmt->nBlockAlign) chunk = pFmt->nBlockAlign;
+    // round chunk to block align
+    chunk = (chunk / pFmt->nBlockAlign) * pFmt->nBlockAlign;
+    if (chunk == 0) chunk = pFmt->nBlockAlign;
+    std::vector<BYTE> zero(chunk, 0);
+    size_t sent = 0;
+    while (sent < totalBytes)
+    {
+        if (pSite->GetActions() & SPVES_ABORT)
+        {
+            // Stop writing immediately on abort
+            return S_OK;
+        }
+        size_t toWriteSz = (totalBytes - sent < chunk) ? (totalBytes - sent) : chunk;
+        ULONG toWrite = (ULONG)toWriteSz;
+        ULONG wrote = 0;
+        HRESULT hr = pSite->Write(zero.data(), toWrite, &wrote);
+        if (FAILED(hr)) return hr;
+        sent += wrote;
+        if (wrote == 0) break; // avoid tight loop on weird hosts
+    }
+    return S_OK;
 }
 
 bool CClipboardVoiceEngine::IsWhitespace(wchar_t ch)
@@ -302,6 +350,8 @@ void CClipboardVoiceEngine::EmitWordAndSentenceEvents(const std::wstring& text,
     while (i < text.size())
     {
         if (pSite->GetActions() & SPVES_ABORT) {
+            ClearClipboardQueueAndCancel();
+            EmitEndStream(pSite, audioBytesWritten);
             return; // stop emitting
         }
 
@@ -356,6 +406,17 @@ void CClipboardVoiceEngine::EmitWordAndSentenceEvents(const std::wstring& text,
             }
         }
     }
+}
+
+void CClipboardVoiceEngine::EmitEndStream(ISpTTSEngineSite* pSite, ULONGLONG audioOffset)
+{
+    if (!pSite) return;
+    SPEVENT endEvt = {};
+    endEvt.eEventId = SPEI_END_INPUT_STREAM;
+    endEvt.elParamType = SPET_LPARAM_IS_UNDEFINED;
+    endEvt.ulStreamNum = 0;
+    endEvt.ullAudioStreamOffset = audioOffset;
+    pSite->AddEvents(&endEvt, 1);
 }
 
 // ---------- Registration of SAPI token ----------

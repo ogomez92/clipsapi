@@ -54,6 +54,7 @@ private:
     static WAVEFORMATEX* CreatePcmWaveFormat(WORD samplesPerSec);
     static std::wstring BuildTextFromFrags(const SPVTEXTFRAG* pList);
     HRESULT WriteTinySilence(ISpTTSEngineSite* pSite, const WAVEFORMATEX* pFmt, double seconds);
+    static void EmitEndStream(ISpTTSEngineSite* pSite, ULONGLONG audioOffset);
 
     // Progress helpers
     static bool IsWhitespace(wchar_t ch);
