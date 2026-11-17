@@ -72,7 +72,9 @@ jobs:
           Copy-Item scripts/* pkg/scripts/
           Copy-Item README.md, test/say.ps1 pkg/
           Compress-Archive -Path pkg/* -DestinationPath "dist/ClipboardVoice-$env:TAG-dlls.zip"
-          Get-FileHash dist/* -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path -Leaf $_.Path)" } | Set-Content dist/SHA256SUMS.txt
+          # LF line endings so `sha256sum -c SHA256SUMS.txt` works everywhere.
+          $sums = Get-FileHash dist/* -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path -Leaf $_.Path)`n" }
+          [IO.File]::WriteAllText("$PWD/dist/SHA256SUMS.txt", -join $sums)
 
       - name: Publish the release
         shell: pwsh
