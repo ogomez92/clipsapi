@@ -1,0 +1,77 @@
+name: Release
+
+# Push a tag like v1.0.0 (it must match installer/Cargo.toml's version) to build
+# the DLLs and the installer on GitHub and attach them to a release of that tag.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build and release, e.g. v1.0.0'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Check the tag matches the installer version
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path installer/Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:TAG) { throw "Tag $env:TAG does not match installer/Cargo.toml version $version" }
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build the voice DLLs (x64 and x86)
+        shell: pwsh
+        run: |
+          msbuild ClipboardVoice/ClipboardVoice.sln /t:Rebuild /p:Configuration=Release /p:Platform=x64 /m /nologo /v:minimal
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          msbuild ClipboardVoice/ClipboardVoice.sln /t:Rebuild /p:Configuration=Release /p:Platform=Win32 /m /nologo /v:minimal
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      # wxdragon builds wxWidgets with CMake and Ninja.
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: installer
+
+      - name: Build the installer
+        working-directory: installer
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist, pkg/x64, pkg/x86, pkg/scripts | Out-Null
+          Copy-Item installer/target/release/ClipboardVoiceInstaller.exe dist/
+          Copy-Item ClipboardVoice/x64/Release/ClipboardVoice.dll pkg/x64/
+          Copy-Item ClipboardVoice/x86/Release/ClipboardVoice.dll pkg/x86/
+          Copy-Item scripts/* pkg/scripts/
+          Copy-Item README.md, test/say.ps1 pkg/
+          Compress-Archive -Path pkg/* -DestinationPath "dist/ClipboardVoice-$env:TAG-dlls.zip"
+          Get-FileHash dist/* -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path -Leaf $_.Path)" } | Set-Content dist/SHA256SUMS.txt
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG (Get-ChildItem dist/*).FullName --clobber
+          } else {
+            gh release create $env:TAG (Get-ChildItem dist/*).FullName --title "Clipboard Voice $env:TAG" --generate-notes
+          }
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

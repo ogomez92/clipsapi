@@ -1,89 +1,97 @@
 #include "ClipboardVoiceEngine.h"
-#include <strsafe.h>
+#include <condition_variable>
+#include <cwctype>
 #include <deque>
 #include <mutex>
-#include <condition_variable>
 #include <thread>
 #include <atomic>
 
-using std::wstring;
-
+// ---------- Background clipboard writer ----------
+//
+// Speak() queues the text and returns to its pacing loop right away; a worker
+// thread puts it on the clipboard, retrying while another program holds it open.
+// Cancelling (abort / purge) bumps a generation counter: anything queued before
+// the bump is dropped, anything queued after it is still written.
 namespace {
+    struct ClipItem
+    {
+        std::wstring text;
+        unsigned generation;
+    };
+
     std::mutex g_qMutex;
     std::condition_variable g_qCv;
-    std::deque<std::wstring> g_queue;
-    std::atomic<bool> g_workerStarted{ false };
-    std::atomic<bool> g_stopWorker{ false };
-    std::thread g_worker;
-    std::atomic<bool> g_cancelWrite{ false };
+    std::deque<ClipItem> g_queue;
+    std::atomic<unsigned> g_generation{ 0 };
+    std::once_flag g_workerOnce;
 
     void WorkerProc()
     {
-        for(;;)
+        for (;;)
         {
-            std::wstring item;
+            ClipItem item;
             {
                 std::unique_lock<std::mutex> lock(g_qMutex);
-                g_qCv.wait(lock, [] { return !g_queue.empty() || g_stopWorker.load(); });
-                if (g_stopWorker.load()) break;
+                g_qCv.wait(lock, [] { return !g_queue.empty(); });
                 item = std::move(g_queue.front());
                 g_queue.pop_front();
             }
-
-            // Try to copy; retry until success, cancellation, or shutdown
-            for (;;)
+            while (item.generation == g_generation.load())
             {
-                if (g_stopWorker.load())
-                    break; // drop item and exit loop
-                if (g_cancelWrite.exchange(false))
-                    break; // drop current item due to abort/purge
-                if (CClipboardVoiceEngine::CopyTextToClipboard(item))
+                if (CClipboardVoiceEngine::CopyTextToClipboard(item.text))
                     break;
-                CClipboardVoiceEngine::SleepMs(50);
+                ::Sleep(50);
             }
         }
     }
 
     void StartWorkerIfNeeded()
     {
-        bool expected = false;
-        if (g_workerStarted.compare_exchange_strong(expected, true))
-        {
-            g_stopWorker.store(false);
-            g_worker = std::thread(WorkerProc);
-        }
+        std::call_once(g_workerOnce, [] {
+            // The worker runs code from this DLL for the rest of the process, so pin
+            // the DLL in memory: COM may otherwise unload it (CoFreeUnusedLibraries)
+            // while the thread is still running, and joining a thread from DllMain
+            // would deadlock on the loader lock. The OS ends the thread at exit.
+            HMODULE self = nullptr;
+            ::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                 reinterpret_cast<LPCWSTR>(&WorkerProc), &self);
+            std::thread(WorkerProc).detach();
+        });
     }
 
-    void StopWorker()
+    void EnqueueClipboardText(const std::wstring& text)
     {
-        if (!g_workerStarted.load()) return;
-        g_stopWorker.store(true);
-        g_qCv.notify_all();
-        if (g_worker.joinable())
+        StartWorkerIfNeeded();
         {
-            // Wait briefly to avoid deadlocks during shutdown
-            g_worker.join();
+            std::lock_guard<std::mutex> lock(g_qMutex);
+            g_queue.push_back({ text, g_generation.load() });
         }
-        g_workerStarted.store(false);
+        g_qCv.notify_one();
     }
 
-    void ClearQueue(bool cancelCurrent)
+    void CancelPendingClipboardWrites()
     {
-        if (cancelCurrent) g_cancelWrite.store(true);
         std::lock_guard<std::mutex> lock(g_qMutex);
+        g_generation.fetch_add(1);
         g_queue.clear();
+    }
+
+    bool Aborted(ISpTTSEngineSite* pSite)
+    {
+        return (pSite->GetActions() & SPVES_ABORT) != 0;
     }
 }
 
-// Expose start/stop for DllMain
-void StartClipboardWorker() { StartWorkerIfNeeded(); }
-void StopClipboardWorker() { StopWorker(); }
-void ClearClipboardQueueAndCancel() { ClearQueue(true); }
-void ClearClipboardQueue() { ClearQueue(false); }
+// ---------- Engine ----------
+
+// Pacing: every word and every whitespace character takes this long, and every
+// utterance lasts at least kMinUtteranceMs. Callers that wait for speech to end
+// (some games) need the voice to take a little time.
+static const double kMsPerStep = 20.0;
+static const double kMinUtteranceMs = 1000.0;
 
 CClipboardVoiceEngine::CClipboardVoiceEngine()
 {
-    ZeroMemory(&m_wfx, sizeof(m_wfx));
     m_wfx.wFormatTag = WAVE_FORMAT_PCM;
     m_wfx.nSamplesPerSec = 16000;
     m_wfx.wBitsPerSample = 16;
@@ -93,7 +101,6 @@ CClipboardVoiceEngine::CClipboardVoiceEngine()
     m_wfx.cbSize = 0;
 }
 
-// ISpObjectWithToken
 STDMETHODIMP CClipboardVoiceEngine::SetObjectToken(ISpObjectToken* pToken)
 {
     m_cpToken = pToken;
@@ -109,7 +116,7 @@ STDMETHODIMP CClipboardVoiceEngine::GetObjectToken(ISpObjectToken** ppToken)
 }
 
 STDMETHODIMP CClipboardVoiceEngine::GetOutputFormat(const GUID* /*pTargetFormatId*/, const WAVEFORMATEX* /*pTargetWaveFormatEx*/,
-                               GUID* pDesiredFormatId, WAVEFORMATEX** ppCoMemDesiredWaveFormatEx)
+                                                    GUID* pDesiredFormatId, WAVEFORMATEX** ppCoMemDesiredWaveFormatEx)
 {
     if (!pDesiredFormatId || !ppCoMemDesiredWaveFormatEx) return E_POINTER;
     *pDesiredFormatId = SPDFID_WaveFormatEx;
@@ -118,86 +125,51 @@ STDMETHODIMP CClipboardVoiceEngine::GetOutputFormat(const GUID* /*pTargetFormatI
 }
 
 STDMETHODIMP CClipboardVoiceEngine::Speak(DWORD dwFlags, REFGUID /*rguidFormatId*/, const WAVEFORMATEX* pWaveFormatEx,
-                     const SPVTEXTFRAG* pTextFragList, ISpTTSEngineSite* pOutputSite)
+                                          const SPVTEXTFRAG* pTextFragList, ISpTTSEngineSite* pOutputSite)
 {
     if (!pOutputSite || !pTextFragList) return E_INVALIDARG;
 
-    // If host purges queue before speak, or aborts, clear our clipboard queue
-    // Note: dwFlags may carry SPF_PURGEBEFORESPEAK, but we didn't capture it above; keep conservative behavior here.
-    // Also, if an abort is signaled, clear and exit immediately.
-    if (pOutputSite->GetActions() & SPVES_ABORT) {
-        ClearClipboardQueueAndCancel();
-        EmitEndStream(pOutputSite, 0);
+    // Note: SAPI raises START_INPUT_STREAM / END_INPUT_STREAM itself; an engine
+    // that adds its own makes every utterance report them twice.
+
+    if (Aborted(pOutputSite))
+    {
+        CancelPendingClipboardWrites();
         return S_OK;
     }
 
-    // Determine the format we'll pretend to output
-    const WAVEFORMATEX* fmt = pWaveFormatEx ? pWaveFormatEx : &m_wfx;
-
-    // Signal start of stream
-    {
-        SPEVENT startEvt = {};
-        startEvt.eEventId = SPEI_START_INPUT_STREAM;
-        startEvt.elParamType = SPET_LPARAM_IS_UNDEFINED;
-        startEvt.ulStreamNum = 0;
-        startEvt.ullAudioStreamOffset = 0;
-        pOutputSite->AddEvents(&startEvt, 1);
-    }
-
-    // Build the text to place on the clipboard
-    std::wstring text = BuildTextFromFrags(pTextFragList);
-
-    // If this Speak was invoked with PurgeBeforeSpeak, clear pending clipboard updates
     if (dwFlags & SPF_PURGEBEFORESPEAK)
+        CancelPendingClipboardWrites();
+
+    const WAVEFORMATEX* fmt = (pWaveFormatEx && pWaveFormatEx->wFormatTag == WAVE_FORMAT_PCM &&
+                               pWaveFormatEx->nAvgBytesPerSec && pWaveFormatEx->nBlockAlign)
+                                  ? pWaveFormatEx : &m_wfx;
+
+    const SpeechInput input = BuildInput(pTextFragList);
+
+    // Empty or whitespace-only requests (e.g. a "stop talking" call) leave the
+    // clipboard alone instead of wiping it.
+    if (!IsBlank(input.text))
+        EnqueueClipboardText(input.text);
+
+    ULONGLONG audioBytes = 0;
+    if (!EmitProgress(input, pOutputSite, fmt, audioBytes))
     {
-        ClearClipboardQueueAndCancel();
-    }
-
-    // Queue clipboard write asynchronously to avoid losing inputs when clipboard is busy
-    EnqueueTextAsync(text);
-
-    // Emit progress events if requested and trickle out a bit of audio to advance offsets
-    size_t audioBytesWritten = 0;
-
-    // 1000 ms total output target; apportion ~20 ms per word as a default pacing
-    const double totalMs = 1000.0;
-    const double defaultMsPerWord = 20.0;
-    const ULONGLONG forcedInterest = SPFEI(SPEI_WORD_BOUNDARY) | SPFEI(SPEI_SENTENCE_BOUNDARY);
-    EmitWordAndSentenceEvents(text, pOutputSite, fmt, audioBytesWritten, defaultMsPerWord, forcedInterest);
-    if (pOutputSite->GetActions() & SPVES_ABORT) {
-        ClearClipboardQueueAndCancel();
-        EmitEndStream(pOutputSite, audioBytesWritten);
+        CancelPendingClipboardWrites();
         return S_OK;
     }
 
-    // Ensure at least 300ms of audio total
-    double remainingMs = 0.0;
-    if (fmt->nAvgBytesPerSec)
+    const ULONGLONG minBytes = (ULONGLONG)(fmt->nAvgBytesPerSec * (kMinUtteranceMs / 1000.0));
+    if (audioBytes < minBytes)
     {
-        double producedMs = (double)audioBytesWritten * 1000.0 / (double)fmt->nAvgBytesPerSec;
-        if (producedMs < totalMs) remainingMs = totalMs - producedMs;
+        if (!WriteSilence(pOutputSite, fmt, (size_t)(minBytes - audioBytes), audioBytes))
+            CancelPendingClipboardWrites();
     }
-    if (remainingMs > 0.0)
-    {
-        WriteTinySilence(pOutputSite, fmt, remainingMs / 1000.0);
-        audioBytesWritten += (size_t)(fmt->nAvgBytesPerSec * (remainingMs / 1000.0));
-    }
-
-    // End of stream event
-    {
-        SPEVENT endEvt = {};
-        endEvt.eEventId = SPEI_END_INPUT_STREAM;
-        endEvt.elParamType = SPET_LPARAM_IS_UNDEFINED;
-        endEvt.ulStreamNum = 0;
-        endEvt.ullAudioStreamOffset = audioBytesWritten;
-        pOutputSite->AddEvents(&endEvt, 1);
-    }
-
     return S_OK;
 }
 
 // static
-WAVEFORMATEX* CClipboardVoiceEngine::CreatePcmWaveFormat(WORD samplesPerSec)
+WAVEFORMATEX* CClipboardVoiceEngine::CreatePcmWaveFormat(DWORD samplesPerSec)
 {
     WAVEFORMATEX* pwfx = (WAVEFORMATEX*)::CoTaskMemAlloc(sizeof(WAVEFORMATEX));
     if (!pwfx) return nullptr;
@@ -213,294 +185,400 @@ WAVEFORMATEX* CClipboardVoiceEngine::CreatePcmWaveFormat(WORD samplesPerSec)
 }
 
 // static
-void CClipboardVoiceEngine::SleepMs(DWORD ms)
-{
-    ::Sleep(ms);
-}
-
-// static
 bool CClipboardVoiceEngine::CopyTextToClipboard(const std::wstring& text)
 {
-    // Best-effort with a couple retries in case clipboard is busy
+    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
     const int kMaxAttempts = 4;
     for (int attempt = 0; attempt < kMaxAttempts; ++attempt)
     {
-        if (OpenClipboard(nullptr))
+        if (::OpenClipboard(nullptr))
         {
-            EmptyClipboard();
-            size_t bytes = (text.size() + 1) * sizeof(wchar_t);
-            HGLOBAL hglob = GlobalAlloc(GMEM_MOVEABLE, bytes);
-            if (hglob)
+            bool ok = false;
+            if (::EmptyClipboard())
             {
-                void* mem = GlobalLock(hglob);
-                if (mem)
+                HGLOBAL hglob = ::GlobalAlloc(GMEM_MOVEABLE, bytes);
+                if (hglob)
                 {
-                    memcpy(mem, text.c_str(), bytes);
-                    GlobalUnlock(hglob);
-                    SetClipboardData(CF_UNICODETEXT, hglob);
-                }
-                else
-                {
-                    GlobalFree(hglob);
+                    if (void* mem = ::GlobalLock(hglob))
+                    {
+                        memcpy(mem, text.c_str(), bytes);
+                        ::GlobalUnlock(hglob);
+                        // On success the clipboard owns the memory.
+                        ok = ::SetClipboardData(CF_UNICODETEXT, hglob) != nullptr;
+                    }
+                    if (!ok) ::GlobalFree(hglob);
                 }
             }
-            CloseClipboard();
-            return true;
+            ::CloseClipboard();
+            if (ok) return true;
         }
-        SleepMs(30);
+        ::Sleep(30);
     }
     return false;
 }
 
-
 // static
-std::wstring CClipboardVoiceEngine::BuildTextFromFrags(const SPVTEXTFRAG* pList)
+CClipboardVoiceEngine::SpeechInput CClipboardVoiceEngine::BuildInput(const SPVTEXTFRAG* pList)
 {
-    std::wstring result;
+    SpeechInput in;
     for (auto pFrag = pList; pFrag != nullptr; pFrag = pFrag->pNext)
     {
-        if (pFrag->State.eAction == SPVA_Speak || pFrag->State.eAction == SPVA_SpellOut)
+        switch (pFrag->State.eAction)
         {
+        case SPVA_Speak:
+        case SPVA_SpellOut:
+        case SPVA_Pronounce:
             if (pFrag->pTextStart && pFrag->ulTextLen)
             {
-                result.append(pFrag->pTextStart, pFrag->ulTextLen);
+                in.text.append(pFrag->pTextStart, pFrag->ulTextLen);
+                for (ULONG i = 0; i < pFrag->ulTextLen; ++i)
+                    in.srcOffset.push_back(pFrag->ulTextSrcOffset + i);
             }
+            break;
+        case SPVA_Bookmark:
+            in.bookmarks.push_back({ in.text.size(),
+                                     pFrag->pTextStart ? std::wstring(pFrag->pTextStart, pFrag->ulTextLen)
+                                                       : std::wstring() });
+            break;
+        default:
+            break;
         }
-        // Respect abort during long inputs
-        // Note: Cannot access pOutputSite here; only build text.
     }
-    return result;
+    return in;
 }
 
-HRESULT CClipboardVoiceEngine::WriteTinySilence(ISpTTSEngineSite* pSite, const WAVEFORMATEX* pFmt, double seconds)
-{
-    if (!pSite || !pFmt || pFmt->wFormatTag != WAVE_FORMAT_PCM) return S_OK;
-    size_t totalBytes = static_cast<size_t>(pFmt->nAvgBytesPerSec * seconds);
-    if (totalBytes == 0) totalBytes = pFmt->nBlockAlign;
-    const size_t bytesPer10ms = (size_t)((double)pFmt->nAvgBytesPerSec / 100.0);
-    size_t chunk = bytesPer10ms;
-    if (chunk < pFmt->nBlockAlign) chunk = pFmt->nBlockAlign;
-    // round chunk to block align
-    chunk = (chunk / pFmt->nBlockAlign) * pFmt->nBlockAlign;
-    if (chunk == 0) chunk = pFmt->nBlockAlign;
-    std::vector<BYTE> zero(chunk, 0);
-    size_t sent = 0;
-    while (sent < totalBytes)
-    {
-        if (pSite->GetActions() & SPVES_ABORT)
-        {
-            // Stop writing immediately on abort
-            return S_OK;
-        }
-        size_t toWriteSz = (totalBytes - sent < chunk) ? (totalBytes - sent) : chunk;
-        ULONG toWrite = (ULONG)toWriteSz;
-        ULONG wrote = 0;
-        HRESULT hr = pSite->Write(zero.data(), toWrite, &wrote);
-        if (FAILED(hr)) return hr;
-        sent += wrote;
-        if (wrote == 0) break; // avoid tight loop on weird hosts
-    }
-    return S_OK;
-}
-
+// static
 bool CClipboardVoiceEngine::IsWhitespace(wchar_t ch)
 {
-    return ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n' || ch == 0x00A0;
+    return ch == 0x00A0 || std::iswspace(ch);
 }
 
-void CClipboardVoiceEngine::AddEvent(ISpTTSEngineSite* pSite, SPEVENTENUM evtId,
-                         ULONGLONG audioOffset, ULONG wParam, LONG lParam)
+// static
+bool CClipboardVoiceEngine::IsBlank(const std::wstring& text)
+{
+    for (wchar_t ch : text)
+        if (!IsWhitespace(ch)) return false;
+    return true;
+}
+
+// static
+void CClipboardVoiceEngine::AddEvent(ISpTTSEngineSite* pSite, SPEVENTENUM evtId, ULONGLONG audioOffset,
+                                     WPARAM wParam, LPARAM lParam, SPEVENTLPARAMTYPE lParamType)
 {
     SPEVENT evt = {};
     evt.eEventId = evtId;
-    evt.elParamType = SPET_LPARAM_IS_UNDEFINED;
-    evt.ulStreamNum = 0;
+    evt.elParamType = lParamType;
     evt.ullAudioStreamOffset = audioOffset;
     evt.wParam = wParam;
     evt.lParam = lParam;
     pSite->AddEvents(&evt, 1);
 }
 
-void CClipboardVoiceEngine::EnqueueTextAsync(const std::wstring& text)
+// static
+bool CClipboardVoiceEngine::WriteSilence(ISpTTSEngineSite* pSite, const WAVEFORMATEX* pFmt,
+                                         size_t bytes, ULONGLONG& audioBytes)
 {
-    StartWorkerIfNeeded();
+    const size_t align = pFmt->nBlockAlign ? pFmt->nBlockAlign : 1;
+    bytes = (bytes / align) * align;
+    // Write in ~10 ms chunks so an abort is noticed quickly.
+    size_t chunk = ((size_t)(pFmt->nAvgBytesPerSec / 100) / align) * align;
+    if (chunk == 0) chunk = align;
+    static const BYTE kZeros[4096] = {};
+    if (chunk > sizeof(kZeros)) chunk = (sizeof(kZeros) / align) * align;
+
+    size_t sent = 0;
+    while (sent < bytes)
     {
-        std::lock_guard<std::mutex> lock(g_qMutex);
-        g_queue.emplace_back(text);
+        if (Aborted(pSite)) return false;
+        const ULONG toWrite = (ULONG)((bytes - sent < chunk) ? (bytes - sent) : chunk);
+        ULONG wrote = 0;
+        if (FAILED(pSite->Write(kZeros, toWrite, &wrote)) || wrote == 0)
+            break; // output gone; nothing more to do
+        sent += wrote;
+        audioBytes += wrote;
     }
-    g_qCv.notify_one();
+    return !Aborted(pSite);
 }
 
-void CClipboardVoiceEngine::EmitWordAndSentenceEvents(const std::wstring& text,
-                                          ISpTTSEngineSite* pSite,
-                                          const WAVEFORMATEX* pFmt,
-                                          size_t& audioBytesWritten,
-                                          double msPerWord,
-                                          ULONGLONG interestMask)
+// static
+bool CClipboardVoiceEngine::EmitProgress(const SpeechInput& in, ISpTTSEngineSite* pSite,
+                                         const WAVEFORMATEX* pFmt, ULONGLONG& audioBytes)
 {
-    if (!pSite || !pFmt || !pFmt->nAvgBytesPerSec) return;
+    const std::wstring& text = in.text;
+    const size_t stepBytes = (size_t)(pFmt->nAvgBytesPerSec * (kMsPerStep / 1000.0));
+    size_t nextBookmark = 0;
 
-    const bool wantWord = (interestMask & SPFEI(SPEI_WORD_BOUNDARY)) != 0;
-    const bool wantSent = (interestMask & SPFEI(SPEI_SENTENCE_BOUNDARY)) != 0;
+    auto emitBookmarksUpTo = [&](size_t pos) {
+        for (; nextBookmark < in.bookmarks.size() && in.bookmarks[nextBookmark].at <= pos; ++nextBookmark)
+        {
+            const std::wstring& name = in.bookmarks[nextBookmark].name;
+            // SAPI copies the string; wParam carries the numeric value as SAPI's own engines do.
+            AddEvent(pSite, SPEI_TTS_BOOKMARK, audioBytes, (WPARAM)_wtol(name.c_str()),
+                     (LPARAM)name.c_str(), SPET_LPARAM_IS_STRING);
+        }
+    };
+    // Length in the caller's string of text[from, to): ends of a range can sit in
+    // different fragments, so measure with the source offsets.
+    auto srcLen = [&](size_t from, size_t to) -> WPARAM {
+        return (WPARAM)(in.srcOffset[to - 1] + 1 - in.srcOffset[from]);
+    };
+    auto endsSentence = [&](size_t wordEnd, size_t wordStart) {
+        size_t k = wordEnd;
+        while (k > wordStart && wcschr(L"\"')]}\x201D\x2019\x00BB", text[k - 1])) --k;
+        return k > wordStart && wcschr(L".!?\x2026", text[k - 1]) != nullptr;
+    };
 
-    const size_t bytesPerMs = (size_t)((double)pFmt->nAvgBytesPerSec / 1000.0);
-    const size_t chunkBytes = (size_t)(bytesPerMs * (msPerWord > 0.0 ? msPerWord : 10.0));
-
+    bool atSentenceStart = true;
     size_t i = 0;
     while (i < text.size())
     {
-        if (pSite->GetActions() & SPVES_ABORT) {
-            ClearClipboardQueueAndCancel();
-            EmitEndStream(pSite, audioBytesWritten);
-            return; // stop emitting
-        }
+        if (Aborted(pSite)) return false;
+        emitBookmarksUpTo(i);
 
-        // Skip leading whitespace
-        while (i < text.size() && IsWhitespace(text[i]))
+        if (IsWhitespace(text[i]))
         {
-            if (wantWord)
-            {
-                // Treat whitespace as advancing time slightly
-                ULONG dummyWritten = 0;
-                if (chunkBytes)
-                {
-                    std::vector<BYTE> z(chunkBytes, 0);
-                    pSite->Write(z.data(), (ULONG)z.size(), &dummyWritten);
-                    audioBytesWritten += dummyWritten;
-                }
-            }
+            if (!WriteSilence(pSite, pFmt, stepBytes, audioBytes)) return false;
             ++i;
+            continue;
         }
-        if (i >= text.size()) break;
 
-        // Start of a word
-        size_t start = i;
+        const size_t start = i;
         while (i < text.size() && !IsWhitespace(text[i])) ++i;
-        size_t len = i - start;
 
-        // Emit word boundary
-        if (wantWord)
+        if (atSentenceStart)
         {
-            AddEvent(pSite, SPEI_WORD_BOUNDARY, audioBytesWritten, (ULONG)start, (LONG)len);
-        }
-
-        // Advance audio a bit to simulate progress
-        if (chunkBytes)
-        {
-            ULONG wrote = 0;
-            std::vector<BYTE> z(chunkBytes, 0);
-            pSite->Write(z.data(), (ULONG)z.size(), &wrote);
-            audioBytesWritten += wrote;
-        }
-
-        // Sentence boundary detection: on punctuation . ! ? followed by space or end
-        if (wantSent && len > 0)
-        {
-            wchar_t last = text[start + len - 1];
-            if (last == L'.' || last == L'!' || last == L'?')
+            size_t end = i, j = i;
+            while (!endsSentence(end, start) && j < text.size())
             {
-                // Find sentence start (very rough): previous whitespace
-                size_t sBeg = start;
-                while (sBeg > 0 && !IsWhitespace(text[sBeg - 1])) --sBeg;
-                AddEvent(pSite, SPEI_SENTENCE_BOUNDARY, audioBytesWritten, (ULONG)sBeg, (LONG)(i - sBeg));
+                while (j < text.size() && IsWhitespace(text[j])) ++j;
+                const size_t ws = j;
+                while (j < text.size() && !IsWhitespace(text[j])) ++j;
+                if (j > ws) end = j;
+                if (j > ws && endsSentence(j, ws)) break;
             }
+            // SPEI_SENTENCE_BOUNDARY / SPEI_WORD_BOUNDARY: lParam = position, wParam = length.
+            AddEvent(pSite, SPEI_SENTENCE_BOUNDARY, audioBytes, srcLen(start, end), (LPARAM)in.srcOffset[start]);
+            atSentenceStart = false;
         }
+        AddEvent(pSite, SPEI_WORD_BOUNDARY, audioBytes, srcLen(start, i), (LPARAM)in.srcOffset[start]);
+        if (endsSentence(i, start)) atSentenceStart = true;
+
+        if (!WriteSilence(pSite, pFmt, stepBytes, audioBytes)) return false;
     }
+    emitBookmarksUpTo(SIZE_MAX);
+    return true;
 }
 
-void CClipboardVoiceEngine::EmitEndStream(ISpTTSEngineSite* pSite, ULONGLONG audioOffset)
-{
-    if (!pSite) return;
-    SPEVENT endEvt = {};
-    endEvt.eEventId = SPEI_END_INPUT_STREAM;
-    endEvt.elParamType = SPET_LPARAM_IS_UNDEFINED;
-    endEvt.ulStreamNum = 0;
-    endEvt.ullAudioStreamOffset = audioOffset;
-    pSite->AddEvents(&endEvt, 1);
-}
+// ---------- SAPI voice token registration ----------
+//
+// One token per language. English (en-US) keeps the original key and name
+// ("ClipboardVoice" / "Clipboard Voice") so existing setups keep working; other
+// languages get "ClipboardVoice_<locale>" / "Clipboard Voice (<Language>)".
 
-// ---------- Registration of SAPI token ----------
-#include <shlwapi.h>
-
-static const wchar_t* kTokenKey64 = L"SOFTWARE\\Microsoft\\Speech\\Voices\\Tokens\\ClipboardVoice";
-static const wchar_t* kTokenKey32 = L"SOFTWARE\\WOW6432Node\\Microsoft\\Speech\\Voices\\Tokens\\ClipboardVoice";
+static const wchar_t* kTokensKey = L"SOFTWARE\\Microsoft\\Speech\\Voices\\Tokens";
+static const wchar_t* kTokenPrefix = L"ClipboardVoice";
 static const wchar_t* kVendor = L"Clipboard Voice";
-static const wchar_t* kName = L"Clipboard Voice";
-static const wchar_t* kLangHex = L"409"; // en-US
+static const wchar_t* kBaseName = L"Clipboard Voice";
 static const wchar_t* kClsidStr = L"{F4ABF2E3-9F21-4B8C-B410-4A0A9E5C5BD3}";
+static const REGSAM kViews[] = { KEY_WOW64_64KEY, KEY_WOW64_32KEY };
 
-static HRESULT WriteToken(HKEY root, REGSAM view)
+struct VoiceLanguage
 {
+    std::wstring keyName;   // token key under ...\Voices\Tokens
+    std::wstring name;      // voice name shown to users
+    std::wstring langAttr;  // SAPI "Language" attribute, e.g. "C0A;A"
+};
+
+static HRESULT ResolveVoiceLanguage(const std::wstring& requested, VoiceLanguage& out)
+{
+    // "es" -> "es-ES", "en" -> "en-US"; specific names pass through.
+    wchar_t specific[LOCALE_NAME_MAX_LENGTH] = {};
+    if (!::ResolveLocaleName(requested.c_str(), specific, LOCALE_NAME_MAX_LENGTH) || !specific[0])
+        return E_INVALIDARG;
+    const LCID lcid = ::LocaleNameToLCID(specific, 0);
+    if (lcid == 0 || lcid == LOCALE_CUSTOM_UNSPECIFIED || lcid == LOCALE_CUSTOM_DEFAULT)
+        return E_INVALIDARG;
+    const LANGID langId = LANGIDFROMLCID(lcid);
+    const LANGID neutral = MAKELANGID(PRIMARYLANGID(langId), SUBLANG_NEUTRAL);
+
+    wchar_t buf[128];
+    swprintf_s(buf, L"%X;%X", langId, neutral);
+    out.langAttr = buf;
+
+    if (_wcsicmp(specific, L"en-US") == 0)
+    {
+        out.keyName = kTokenPrefix;
+        out.name = kBaseName;
+        return S_OK;
+    }
+
+    // A neutral request ("es") is shown as the language ("Spanish"); a specific
+    // one ("es-MX") as language and region ("Spanish (Mexico)").
+    const bool isNeutral = requested.find(L'-') == std::wstring::npos && requested.find(L'_') == std::wstring::npos;
+    wchar_t display[128] = {};
+    if (!::GetLocaleInfoEx(specific, isNeutral ? LOCALE_SENGLISHLANGUAGENAME : LOCALE_SENGLISHDISPLAYNAME,
+                           display, ARRAYSIZE(display)))
+        wcscpy_s(display, specific);
+
+    std::wstring id = isNeutral ? requested : std::wstring(specific);
+    for (auto& ch : id) ch = (wchar_t)towlower(ch);
+    out.keyName = std::wstring(kTokenPrefix) + L"_" + id;
+    out.name = std::wstring(kBaseName) + L" (" + display + L")";
+    return S_OK;
+}
+
+static LONG SetString(HKEY hKey, const wchar_t* name, const std::wstring& value)
+{
+    return ::RegSetValueExW(hKey, name, 0, REG_SZ, (const BYTE*)value.c_str(),
+                            (DWORD)((value.size() + 1) * sizeof(wchar_t)));
+}
+
+static HRESULT WriteToken(REGSAM view, const VoiceLanguage& lang)
+{
+    const std::wstring path = std::wstring(kTokensKey) + L"\\" + lang.keyName;
     HKEY hKey = nullptr;
-    LONG r = RegCreateKeyExW(root, kTokenKey64, 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE | view, nullptr, &hKey, nullptr);
+    LONG r = ::RegCreateKeyExW(HKEY_LOCAL_MACHINE, path.c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
+                               KEY_WRITE | view, nullptr, &hKey, nullptr);
     if (r != ERROR_SUCCESS) return HRESULT_FROM_WIN32(r);
 
-    // Default = readable name
-    RegSetValueExW(hKey, nullptr, 0, REG_SZ, (const BYTE*)kName, (DWORD)((wcslen(kName)+1)*sizeof(wchar_t)));
-    RegSetValueExW(hKey, L"CLSID", 0, REG_SZ, (const BYTE*)kClsidStr, (DWORD)((wcslen(kClsidStr)+1)*sizeof(wchar_t)));
-    RegSetValueExW(hKey, L"Version", 0, REG_SZ, (const BYTE*)L"1.0", (DWORD)(sizeof(L"1.0")));
+    if (r == ERROR_SUCCESS) r = SetString(hKey, nullptr, lang.name);
+    if (r == ERROR_SUCCESS) r = SetString(hKey, L"CLSID", kClsidStr);
+    if (r == ERROR_SUCCESS) r = SetString(hKey, L"Version", L"1.0");
 
-    // Attributes
     HKEY hAttr = nullptr;
-    r = RegCreateKeyExW(hKey, L"Attributes", 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE | view, nullptr, &hAttr, nullptr);
+    if (r == ERROR_SUCCESS)
+        r = ::RegCreateKeyExW(hKey, L"Attributes", 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE | view,
+                              nullptr, &hAttr, nullptr);
     if (r == ERROR_SUCCESS)
     {
-        RegSetValueExW(hAttr, L"Language", 0, REG_SZ, (const BYTE*)kLangHex, (DWORD)((wcslen(kLangHex)+1)*sizeof(wchar_t)));
-        RegSetValueExW(hAttr, L"Name", 0, REG_SZ, (const BYTE*)kName, (DWORD)((wcslen(kName)+1)*sizeof(wchar_t)));
-        RegSetValueExW(hAttr, L"Vendor", 0, REG_SZ, (const BYTE*)kVendor, (DWORD)((wcslen(kVendor)+1)*sizeof(wchar_t)));
-        RegSetValueExW(hAttr, L"Gender", 0, REG_SZ, (const BYTE*)L"Neutral", (DWORD)(sizeof(L"Neutral")));
-        RegSetValueExW(hAttr, L"Age", 0, REG_SZ, (const BYTE*)L"Adult", (DWORD)(sizeof(L"Adult")));
-        RegCloseKey(hAttr);
+        r = SetString(hAttr, L"Language", lang.langAttr);
+        if (r == ERROR_SUCCESS) r = SetString(hAttr, L"Name", lang.name);
+        if (r == ERROR_SUCCESS) r = SetString(hAttr, L"Vendor", kVendor);
+        if (r == ERROR_SUCCESS) r = SetString(hAttr, L"Gender", L"Neutral");
+        if (r == ERROR_SUCCESS) r = SetString(hAttr, L"Age", L"Adult");
+        ::RegCloseKey(hAttr);
     }
 
-    // Optionally declare audio format
     HKEY hAF = nullptr;
-    r = RegCreateKeyExW(hKey, L"AudioFormats", 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE | view, nullptr, &hAF, nullptr);
-    if (r == ERROR_SUCCESS)
+    if (r == ERROR_SUCCESS &&
+        ::RegCreateKeyExW(hKey, L"AudioFormats", 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE | view,
+                          nullptr, &hAF, nullptr) == ERROR_SUCCESS)
     {
-        // Declaring SAFT16kHz16BitMono as supported
-        RegSetValueExW(hAF, L"1", 0, REG_SZ, (const BYTE*)L"SAFT16kHz16BitMono", (DWORD)(sizeof(L"SAFT16kHz16BitMono")));
-        RegCloseKey(hAF);
+        SetString(hAF, L"1", L"SAFT16kHz16BitMono");
+        ::RegCloseKey(hAF);
     }
 
-    RegCloseKey(hKey);
-    return S_OK;
+    ::RegCloseKey(hKey);
+    return HRESULT_FROM_WIN32(r);
 }
 
-HRESULT RegisterSapiToken()
+static bool IsOurTokenKey(const wchar_t* name)
 {
-    // Write both 64-bit and 32-bit token views from a 64-bit process; if registering from 32-bit, the 64-key write will still work.
-    HRESULT hr1 = WriteToken(HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY);
-    HRESULT hr2 = WriteToken(HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY);
-    // Prefer returning success if at least one succeeded
-    if (SUCCEEDED(hr1) || SUCCEEDED(hr2)) return S_OK;
-    return FAILED(hr1) ? hr1 : hr2;
+    const size_t n = wcslen(kTokenPrefix);
+    return _wcsnicmp(name, kTokenPrefix, n) == 0 && (name[n] == L'\0' || name[n] == L'_');
 }
 
-static void DeleteKeyRecursive(HKEY root, const wchar_t* subkey, REGSAM view)
+// Names of our tokens present in one registry view.
+static std::vector<std::wstring> ListOurTokens(REGSAM view)
 {
-    // Simple recursive delete using SHDeleteKey if available
-    HMODULE hShlwapi = LoadLibraryW(L"Shlwapi.dll");
-    if (hShlwapi)
+    std::vector<std::wstring> found;
+    HKEY hTokens = nullptr;
+    if (::RegOpenKeyExW(HKEY_LOCAL_MACHINE, kTokensKey, 0, KEY_ENUMERATE_SUB_KEYS | view, &hTokens) != ERROR_SUCCESS)
+        return found;
+    wchar_t name[256];
+    for (DWORD i = 0;; ++i)
     {
-        typedef LSTATUS (WINAPI *PFNSHDELETEKEYW)(HKEY, LPCWSTR);
-        auto pfn = (PFNSHDELETEKEYW)GetProcAddress(hShlwapi, "SHDeleteKeyW");
-        if (pfn)
+        DWORD len = ARRAYSIZE(name);
+        const LONG r = ::RegEnumKeyExW(hTokens, i, name, &len, nullptr, nullptr, nullptr, nullptr);
+        if (r == ERROR_NO_MORE_ITEMS) break;
+        if (r == ERROR_SUCCESS && IsOurTokenKey(name)) found.emplace_back(name);
+    }
+    ::RegCloseKey(hTokens);
+    return found;
+}
+
+HRESULT UnregisterSapiTokens()
+{
+    HRESULT result = S_OK;
+    for (REGSAM view : kViews)
+    {
+        const auto names = ListOurTokens(view);
+        if (names.empty()) continue;
+        HKEY hTokens = nullptr;
+        const LONG r = ::RegOpenKeyExW(HKEY_LOCAL_MACHINE, kTokensKey, 0, KEY_ALL_ACCESS | view, &hTokens);
+        if (r != ERROR_SUCCESS) { result = HRESULT_FROM_WIN32(r); continue; }
+        for (const auto& name : names)
         {
-            HKEY hView = nullptr;
-            if (RegOpenKeyExW(root, L"", 0, KEY_WRITE | view, &hView) == ERROR_SUCCESS)
-            {
-                pfn(hView, subkey);
-                RegCloseKey(hView);
-            }
+            const LONG d = ::RegDeleteTreeW(hTokens, name.c_str());
+            if (d != ERROR_SUCCESS && d != ERROR_FILE_NOT_FOUND) result = HRESULT_FROM_WIN32(d);
         }
-        FreeLibrary(hShlwapi);
+        ::RegCloseKey(hTokens);
     }
+    return result;
 }
 
-HRESULT UnregisterSapiToken()
+static std::vector<std::wstring> SplitLanguages(const wchar_t* list)
 {
-    DeleteKeyRecursive(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Speech\\Voices\\Tokens\\ClipboardVoice", KEY_WOW64_64KEY);
-    DeleteKeyRecursive(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Microsoft\\Speech\\Voices\\Tokens\\ClipboardVoice", KEY_WOW64_32KEY);
-    return S_OK;
+    std::vector<std::wstring> out;
+    std::wstring cur;
+    auto flush = [&] {
+        if (!cur.empty())
+        {
+            for (auto& ch : cur) if (ch == L'_') ch = L'-';
+            bool dup = false;
+            for (const auto& s : out) dup = dup || _wcsicmp(s.c_str(), cur.c_str()) == 0;
+            if (!dup) out.push_back(cur);
+            cur.clear();
+        }
+    };
+    for (const wchar_t* p = list ? list : L""; *p; ++p)
+    {
+        if (*p == L',' || *p == L';' || *p == L'"' || std::iswspace(*p)) flush();
+        else cur.push_back(*p);
+    }
+    flush();
+    return out;
+}
+
+HRESULT RegisterSapiTokens(const wchar_t* languages)
+{
+    auto requested = SplitLanguages(languages);
+    if (requested.empty()) requested.push_back(L"en");
+
+    // Validate everything before touching the registry.
+    std::vector<VoiceLanguage> voices;
+    for (const auto& code : requested)
+    {
+        VoiceLanguage v;
+        const HRESULT hr = ResolveVoiceLanguage(code, v);
+        if (FAILED(hr)) return hr;
+        bool dup = false;
+        for (const auto& existing : voices) dup = dup || _wcsicmp(existing.keyName.c_str(), v.keyName.c_str()) == 0;
+        if (!dup) voices.push_back(v);
+    }
+
+    // Replace the previous set so removed languages disappear.
+    UnregisterSapiTokens();
+
+    HRESULT result = E_FAIL;
+    for (REGSAM view : kViews)
+    {
+        HRESULT viewHr = S_OK;
+        for (const auto& v : voices)
+        {
+            const HRESULT hr = WriteToken(view, v);
+            if (FAILED(hr)) viewHr = hr;
+        }
+        // Succeed if at least one registry view got every voice.
+        if (SUCCEEDED(viewHr)) result = S_OK;
+        else if (FAILED(result)) result = viewHr;
+    }
+    return result;
+}
+
+bool AnySapiTokenRegistered()
+{
+    for (REGSAM view : kViews)
+        if (!ListOurTokens(view).empty()) return true;
+    return false;
 }

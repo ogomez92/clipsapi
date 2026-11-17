@@ -10,25 +10,16 @@ CClipboardVoiceModule _AtlModule;
 
 OBJECT_ENTRY_AUTO(CLSID_ClipboardVoiceEngine, CClipboardVoiceEngine)
 
-// Start/stop the clipboard worker from the engine unit
-void StartClipboardWorker();
-void StopClipboardWorker();
+bool AnySapiTokenRegistered();
 
-extern "C" BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpReserved)
+extern "C" BOOL WINAPI DllMain(HINSTANCE /*hInstance*/, DWORD dwReason, LPVOID lpReserved)
 {
-    if (dwReason == DLL_PROCESS_DETACH)
-    {
-        // Ensure background worker exits before the module unloads
-        StopClipboardWorker();
-    }
+    // The clipboard worker thread pins the DLL once started, so there is
+    // nothing to tear down here (and joining a thread under the loader lock
+    // would deadlock).
     return _AtlModule.DllMain(dwReason, lpReserved);
 }
 
-// Forward decl for helper creating SAPI token keys
-HRESULT RegisterSapiToken();
-HRESULT UnregisterSapiToken();
-
-// Exported functions
 STDAPI DllCanUnloadNow(void)
 {
     return _AtlModule.DllCanUnloadNow();
@@ -39,22 +30,30 @@ STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv)
     return _AtlModule.DllGetClassObject(rclsid, riid, ppv);
 }
 
+// regsvr32 ClipboardVoice.dll
+// Registers the COM class. Adds the English voice only when no Clipboard Voice
+// token exists yet, so re-registering keeps the languages chosen earlier.
 STDAPI DllRegisterServer(void)
 {
-    // Skip type library registration to avoid TYPE_E_CANTLOADLIBRARY (0x80029C4A)
-    // We don't require a registered TLB for this engine.
+    // Skip type library registration to avoid TYPE_E_CANTLOADLIBRARY (0x80029C4A);
+    // the engine doesn't need a registered TLB.
     HRESULT hr = _AtlModule.DllRegisterServer(FALSE);
-    if (SUCCEEDED(hr))
-    {
-        // Create SAPI Voice Token entries
-        hr = RegisterSapiToken();
-    }
+    if (SUCCEEDED(hr) && !AnySapiTokenRegistered())
+        hr = RegisterSapiTokens(L"en");
     return hr;
 }
 
+// regsvr32 /u ClipboardVoice.dll
 STDAPI DllUnregisterServer(void)
 {
-    UnregisterSapiToken();
-    // Skip type library unregistration to match registration behavior
+    UnregisterSapiTokens();
     return _AtlModule.DllUnregisterServer(FALSE);
+}
+
+// regsvr32 /i:en,es ClipboardVoice.dll   -> one voice per language (replaces the previous set)
+// regsvr32 /u /n /i ClipboardVoice.dll   -> removes the voices only
+// Languages are locale names: "en", "es", "es-MX", "fr", ...
+STDAPI DllInstall(BOOL bInstall, LPCWSTR pszCmdLine)
+{
+    return bInstall ? RegisterSapiTokens(pszCmdLine) : UnregisterSapiTokens();
 }

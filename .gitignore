@@ -1,1 +1,22 @@
 .vs
+*.user
+# Build intermediates; only the final DLLs (ClipboardVoice/x64|x86/Release/ClipboardVoice.dll) are kept.
+ClipboardVoice/ClipboardVoice/Release/
+ClipboardVoice/ClipboardVoice/Debug/
+ClipboardVoice/ClipboardVoice/x64/
+ClipboardVoice/Release/
+ClipboardVoice/Debug/
+ClipboardVoice/x64/Debug/
+ClipboardVoice/x86/Debug/
+*.exp
+*.lib
+*.pdb
+*.ipdb
+*.iobj
+# test/eventdump build output
+test/*.exe
+test/*.obj
+
+# Installer build output
+installer/target/
+dist/
