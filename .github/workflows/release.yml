@@ -16,7 +16,8 @@ permissions:
 
 jobs:
   release:
-    runs-on: windows-latest
+    # VS 2022 (toolset v143, like the project). windows-latest's VS 2026 image has no ATL.
+    runs-on: windows-2022
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
@@ -31,6 +32,16 @@ jobs:
           if ("v$version" -ne $env:TAG) { throw "Tag $env:TAG does not match installer/Cargo.toml version $version" }
 
       - uses: microsoft/setup-msbuild@v2
+
+      - name: Make sure Visual Studio has ATL
+        shell: pwsh
+        run: |
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+          $vs = & "$installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (Get-ChildItem "$vs\VC\Tools\MSVC\*\atlmfc\include\atlbase.h" -ErrorAction SilentlyContinue) { Write-Host "ATL present in $vs"; exit 0 }
+          Write-Host "Installing ATL into $vs"
+          $p = Start-Process "$installer\vs_installer.exe" -Wait -PassThru -ArgumentList "modify --installPath `"$vs`" --add Microsoft.VisualStudio.Component.VC.ATL --quiet --norestart --nocache"
+          if (-not (Get-ChildItem "$vs\VC\Tools\MSVC\*\atlmfc\include\atlbase.h" -ErrorAction SilentlyContinue)) { throw "ATL install failed (exit $($p.ExitCode))" }
 
       - name: Build the voice DLLs (x64 and x86)
         shell: pwsh
