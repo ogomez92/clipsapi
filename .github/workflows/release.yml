@@ -65,12 +65,14 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist, pkg/x64, pkg/x86, pkg/scripts | Out-Null
+          # Same layout as the repo, so scripts\install.bat finds the DLLs after unzipping.
+          New-Item -ItemType Directory -Force dist, pkg/ClipboardVoice/x64/Release, pkg/ClipboardVoice/x86/Release, pkg/scripts, pkg/test | Out-Null
           Copy-Item installer/target/release/ClipboardVoiceInstaller.exe dist/
-          Copy-Item ClipboardVoice/x64/Release/ClipboardVoice.dll pkg/x64/
-          Copy-Item ClipboardVoice/x86/Release/ClipboardVoice.dll pkg/x86/
+          Copy-Item ClipboardVoice/x64/Release/ClipboardVoice.dll pkg/ClipboardVoice/x64/Release/
+          Copy-Item ClipboardVoice/x86/Release/ClipboardVoice.dll pkg/ClipboardVoice/x86/Release/
           Copy-Item scripts/* pkg/scripts/
-          Copy-Item README.md, test/say.ps1 pkg/
+          Copy-Item test/say.ps1 pkg/test/
+          Copy-Item README.md pkg/
           Compress-Archive -Path pkg/* -DestinationPath "dist/ClipboardVoice-$env:TAG-dlls.zip"
           # LF line endings so `sha256sum -c SHA256SUMS.txt` works everywhere.
           $sums = Get-FileHash dist/* -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path -Leaf $_.Path)`n" }
