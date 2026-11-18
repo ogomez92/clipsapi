@@ -1,0 +1,15 @@
+HKCR
+{
+    NoRemove CLSID
+    {
+        ForceRemove {8D3B6C1E-2F47-4A5D-9B0E-6C1F2A7D4E95} = s 'Sapi2Prism Engine Class'
+        {
+            InprocServer32 = s '%MODULE%'
+            {
+                val ThreadingModel = s 'Both'
+            }
+            ProgID = s 'Sapi2Prism.Engine'
+            VersionIndependentProgID = s 'Sapi2Prism.Engine'
+        }
+    }
+}

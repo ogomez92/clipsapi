@@ -66,10 +66,12 @@ jobs:
         shell: pwsh
         run: |
           # Same layout as the repo, so scripts\install.bat finds the DLLs after unzipping.
-          New-Item -ItemType Directory -Force dist, pkg/ClipboardVoice/x64/Release, pkg/ClipboardVoice/x86/Release, pkg/scripts, pkg/test | Out-Null
+          New-Item -ItemType Directory -Force dist, pkg/ClipboardVoice/x64/Release, pkg/ClipboardVoice/x86/Release, pkg/scripts, pkg/test, pkg/vendor | Out-Null
           Copy-Item installer/target/release/ClipboardVoiceInstaller.exe dist/
           Copy-Item ClipboardVoice/x64/Release/ClipboardVoice.dll pkg/ClipboardVoice/x64/Release/
           Copy-Item ClipboardVoice/x86/Release/ClipboardVoice.dll pkg/ClipboardVoice/x86/Release/
+          # prism.dll (both architectures) and its licences, for the Sapi2Prism voices.
+          Copy-Item -Recurse vendor/prism pkg/vendor/
           Copy-Item scripts/* pkg/scripts/
           Copy-Item test/say.ps1 pkg/test/
           Copy-Item README.md pkg/

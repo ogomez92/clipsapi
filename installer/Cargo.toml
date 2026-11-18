@@ -1,6 +1,6 @@
 [package]
 name = "clipboard-voice-installer"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "Installer for Clipboard Voice, the SAPI 5 voice that writes speech to the clipboard"
 

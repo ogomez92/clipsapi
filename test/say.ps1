@@ -9,8 +9,8 @@ $voices = $v.GetVoices("Name=$Voice")
 if ($voices.Count -gt 0) {
     $v.Voice = $voices.Item(0)
 } else {
-    Write-Host "$Voice not found; using the default voice. Installed Clipboard voices:"
-    foreach ($t in $v.GetVoices()) { if ($t.Id -match '\\ClipboardVoice') { Write-Host "  $($t.GetDescription())" } }
+    Write-Host "$Voice not found; using the default voice. Installed Clipboard Voice and Sapi2Prism voices:"
+    foreach ($t in $v.GetVoices()) { if ($t.Id -match '\\(ClipboardVoice|Sapi2Prism)') { Write-Host "  $($t.GetDescription())" } }
 }
 
 $v.Speak($Text) | Out-Null

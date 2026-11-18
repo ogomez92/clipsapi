@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use wxdragon::prelude::*;
 
-use crate::core::{self, Language};
+use crate::core::{self, Language, Output, VoiceKind};
 
 struct State {
     langs: Vec<Language>,
@@ -16,6 +16,8 @@ struct State {
 struct Ui {
     frame: Frame,
     status: StaticText,
+    clipboard_cb: CheckBox,
+    prism_cb: CheckBox,
     search: TextCtrl,
     list: CheckListBox,
     selected: StaticText,
@@ -37,9 +39,22 @@ pub fn run(start_uninstall: bool) {
         let intro = StaticText::builder(&panel)
             .with_label(
                 "Clipboard Voice is a SAPI voice that puts the text programs speak on the clipboard. \
-                 It adds one voice per language you check below.",
+                 Prism adds voices named Sapi2Prism that speak it through your screen reader (NVDA, JAWS, Narrator and others, found automatically). \
+                 Check one or both; each adds one voice per language you check below.",
             )
             .build();
+
+        let current = core::installed_output().unwrap_or(Output::Clipboard);
+        let check = |label: &str, on: bool| {
+            let cb = CheckBox::builder(&panel).with_label(label).build();
+            // Screen readers may get a wx control's window name (a generic default)
+            // instead of its label, so name it after its label.
+            cb.set_name(label);
+            cb.set_value(on);
+            cb
+        };
+        let clipboard_cb = check("Clipboard Voice", current.has(VoiceKind::Clipboard));
+        let prism_cb = check("Prism", current.has(VoiceKind::Prism));
 
         // In wxWidgets on Windows, the label right before a control is the name a screen reader gives it.
         let search_label = StaticText::builder(&panel).with_label("Search languages (name or code, e.g. spanish or es-MX):").build();
@@ -64,6 +79,8 @@ pub fn run(start_uninstall: bool) {
 
         sizer.add(&status, 0, SizerFlag::Expand | SizerFlag::All, 8);
         sizer.add(&intro, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, 8);
+        sizer.add(&clipboard_cb, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, 8);
+        sizer.add(&prism_cb, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, 4);
         sizer.add(&search_label, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, 8);
         sizer.add(&search, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, 8);
         sizer.add(&list_label, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, 8);
@@ -74,10 +91,10 @@ pub fn run(start_uninstall: bool) {
         sizer.add(&log, 1, SizerFlag::Expand | SizerFlag::All, 8);
         panel.set_sizer(sizer, true);
 
-        let ui = Ui { frame: frame.clone(), status, search: search.clone(), list: list.clone(), selected, install_btn: install_btn.clone(), uninstall_btn: uninstall_btn.clone(), log };
+        let ui = Ui { frame: frame.clone(), status, clipboard_cb, prism_cb, search: search.clone(), list: list.clone(), selected, install_btn: install_btn.clone(), uninstall_btn: uninstall_btn.clone(), log };
 
         let langs = core::all_languages();
-        let installed: Vec<String> = core::installed_voices().into_iter().map(|v| v.code).collect();
+        let installed = core::installed_codes();
         let mut checked: Vec<bool> = langs.iter().map(|l| installed.iter().any(|c| c.eq_ignore_ascii_case(&l.code))).collect();
         if installed.is_empty() {
             if let Some(i) = langs.iter().position(|l| l.code == "en") {
@@ -124,7 +141,7 @@ pub fn run(start_uninstall: bool) {
             // Opened from Settings > Apps > Uninstall.
             do_uninstall(&ui, &state);
         } else {
-            search.set_focus();
+            clipboard_cb.set_focus();
         }
     })
     .expect("Failed to start application");
@@ -181,7 +198,7 @@ fn refresh(ui: &Ui, state: &Rc<RefCell<State>>) {
     } else {
         let names: Vec<String> = voices.iter().map(|v| v.name.clone()).collect();
         ui.status.set_label(&format!("Installed voices: {}.", names.join(", ")));
-        ui.install_btn.set_label("Apply languages");
+        ui.install_btn.set_label("Apply changes");
     }
     ui.uninstall_btn.enable(core::is_installed());
     update_selected(ui, state);
@@ -193,19 +210,33 @@ fn do_install(ui: &Ui, state: &Rc<RefCell<State>>) {
         show_message(&ui.frame, "Check at least one language first.", "Nothing to install", true);
         return;
     }
+    let output = match (ui.clipboard_cb.is_checked(), ui.prism_cb.is_checked()) {
+        (true, true) => Output::Both,
+        (true, false) => Output::Clipboard,
+        (false, true) => Output::Prism,
+        (false, false) => {
+            show_message(&ui.frame, "Check Clipboard Voice, Prism or both first.", "Nothing to install", true);
+            return;
+        }
+    };
     set_busy(ui, true);
     ui.status.set_label("Installing...");
     let log = ui.log.clone();
-    let result = core::install(&codes, &mut |m| log_append(&log, m));
+    let result = core::install(&codes, output, &mut |m| log_append(&log, m));
     set_busy(ui, false);
     refresh(ui, state);
     match result {
         Ok(voices) => {
             let names: Vec<String> = voices.iter().map(|v| v.name.clone()).collect();
+            let prism_note = if output.has(VoiceKind::Prism) {
+                "\n\nThe Sapi2Prism voices speak through the screen reader that is running; with none running they stay silent."
+            } else {
+                ""
+            };
             show_message(
                 &ui.frame,
                 &format!(
-                    "Clipboard Voice is installed. Programs that use SAPI voices now list:\n\n{}\n\nPrograms that were already open may need a restart to see new voices.",
+                    "Installed. Programs that use SAPI voices now list:\n\n{}{prism_note}\n\nPrograms that were already open may need a restart to see new voices.",
                     names.join("\n")
                 ),
                 "Installation complete",
@@ -220,7 +251,7 @@ fn do_install(ui: &Ui, state: &Rc<RefCell<State>>) {
 }
 
 fn do_uninstall(ui: &Ui, state: &Rc<RefCell<State>>) {
-    let confirm = MessageDialog::builder(&ui.frame, "Remove Clipboard Voice and all of its voices?", "Uninstall Clipboard Voice")
+    let confirm = MessageDialog::builder(&ui.frame, "Remove Clipboard Voice, Sapi2Prism and all of their voices?", "Uninstall Clipboard Voice")
         .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconQuestion)
         .build();
     if confirm.show_modal() != ID_YES {
@@ -242,6 +273,8 @@ fn set_busy(ui: &Ui, busy: bool) {
     ui.uninstall_btn.enable(!busy);
     ui.list.enable(!busy);
     ui.search.enable(!busy);
+    ui.clipboard_cb.enable(!busy);
+    ui.prism_cb.enable(!busy);
 }
 
 fn show_message(parent: &Frame, msg: &str, title: &str, error: bool) {

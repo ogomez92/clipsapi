@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Removes Clipboard Voice: all its SAPI voices, the COM registration and the installed DLLs.
+    Removes Clipboard Voice and Sapi2Prism: all their SAPI voices, the COM registration and the installed DLLs.
     Asks for administrator rights (UAC) when needed.
 #>
 [CmdletBinding()]
@@ -61,7 +61,7 @@ foreach ($i in $installs) {
         $tokens = $hklm.OpenSubKey('SOFTWARE\Microsoft\Speech\Voices\Tokens', $true)
         if ($tokens) {
             foreach ($name in $tokens.GetSubKeyNames()) {
-                if ($name -match '^ClipboardVoice(_.*)?$') { $tokens.DeleteSubKeyTree($name, $false); Write-Log "Removed voice token $name ($($i.Arch) view)." }
+                if ($name -match '^(ClipboardVoice|Sapi2Prism)(_.*)?$') { $tokens.DeleteSubKeyTree($name, $false); Write-Log "Removed voice token $name ($($i.Arch) view)." }
             }
             $tokens.Close()
         }
@@ -69,6 +69,8 @@ foreach ($i in $installs) {
         if ($classes) {
             $classes.DeleteSubKeyTree('CLSID\{F4ABF2E3-9F21-4B8C-B410-4A0A9E5C5BD3}', $false)
             $classes.DeleteSubKeyTree('ClipboardVoice.Engine', $false)
+            $classes.DeleteSubKeyTree('CLSID\{8D3B6C1E-2F47-4A5D-9B0E-6C1F2A7D4E95}', $false)
+            $classes.DeleteSubKeyTree('Sapi2Prism.Engine', $false)
             $classes.Close()
         }
     } catch {

@@ -9,5 +9,11 @@ library ClipboardVoiceLib
     {
         interface IUnknown;
     };
+
+    [uuid(8D3B6C1E-2F47-4A5D-9B0E-6C1F2A7D4E95)]
+    coclass PrismVoiceEngine
+    {
+        interface IUnknown;
+    };
 };
 

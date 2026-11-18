@@ -6,6 +6,8 @@
 //!   ClipboardVoiceInstaller.exe --uninstall            window, asks to uninstall (Settings > Apps)
 //!   ClipboardVoiceInstaller.exe --cli                  interactive console menu
 //!   ClipboardVoiceInstaller.exe --cli --install en,es  install exactly these languages
+//!   ... --install en,es --output prism                 which voices: clipboard, prism or both
+//!                                                      (default: the ones installed now, else clipboard)
 //!   ClipboardVoiceInstaller.exe --cli --uninstall      remove everything
 //!   ClipboardVoiceInstaller.exe --cli --list           list every language code you can use
 //!   ... --log <file>                                   also write console output to a file
@@ -28,8 +30,22 @@ fn main() {
         return;
     }
 
+    let output = match value_of("--output") {
+        None => None,
+        Some(v) => match core::Output::parse(&v) {
+            Some(o) => Some(o),
+            None => {
+                attach_console();
+                println!("Unknown --output '{v}': use clipboard, prism or both.");
+                std::process::exit(2);
+            }
+        },
+    };
     let action = if let Some(langs) = value_of("--install") {
-        cli::Action::Install(langs.split([',', ';']).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        cli::Action::Install(
+            langs.split([',', ';']).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            output,
+        )
     } else if has("--uninstall") {
         cli::Action::Uninstall
     } else if has("--list") {

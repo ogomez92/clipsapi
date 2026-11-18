@@ -1,21 +1,27 @@
 <#
 .SYNOPSIS
-    Installs Clipboard Voice (32-bit and 64-bit) with one SAPI voice per language.
+    Installs Clipboard Voice and/or Sapi2Prism (32-bit and 64-bit) with one SAPI
+    voice per kind and language.
 
 .EXAMPLE
-    .\install.ps1                 # English only
-    .\install.ps1 en es           # English and Spanish
+    .\install.ps1                       # Clipboard Voice, English only
+    .\install.ps1 en es                 # Clipboard Voice, English and Spanish
+    .\install.ps1 en es -Output prism   # Sapi2Prism (speaks through the screen reader)
+    .\install.ps1 en es -Output both    # both kinds
     .\install.ps1 -Languages en-GB,es-MX
 
 .NOTES
     Asks for administrator rights (UAC) when needed. Running it again replaces
-    the installed DLLs and the set of languages.
+    the installed DLLs and the set of voices.
 #>
 [CmdletBinding()]
 param(
     # Locale names: en, es, fr, es-MX, ... "en" keeps the original "Clipboard Voice" name.
     [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
     [string[]]$Languages = @('en'),
+    # clipboard: Clipboard Voice; prism: Sapi2Prism; both.
+    [ValidateSet('clipboard', 'prism', 'both')]
+    [string]$Output = 'clipboard',
     [string]$X64Dll,
     [string]$X86Dll,
     # Internal: set by the elevated copy of this script.
@@ -50,13 +56,16 @@ foreach ($lang in $Languages) {
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $X64Dll) { $X64Dll = Join-Path $repoRoot 'ClipboardVoice\x64\Release\ClipboardVoice.dll' }
 if (-not $X86Dll) { $X86Dll = Join-Path $repoRoot 'ClipboardVoice\x86\Release\ClipboardVoice.dll' }
+$prismDir = Join-Path $repoRoot 'vendor\prism'
+$kinds = switch ($Output) { 'clipboard' { @('clipboard') } 'prism' { @('prism') } 'both' { @('clipboard', 'prism') } }
+$withPrism = $kinds -contains 'prism'
 
 # ---- Elevate ----
 if (-not (Test-Admin)) {
     Write-Log 'Administrator rights are needed; asking Windows for them (UAC prompt)...'
     $log = Join-Path ([IO.Path]::GetTempPath()) ("ClipboardVoice-install-{0}.log" -f [guid]::NewGuid())
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"",
-                 '-Languages', ($Languages -join ','), '-X64Dll', "`"$X64Dll`"", '-X86Dll', "`"$X86Dll`"",
+                 '-Languages', ($Languages -join ','), '-Output', $Output, '-X64Dll', "`"$X64Dll`"", '-X86Dll', "`"$X86Dll`"",
                  '-LogFile', "`"$log`"")
     try {
         $p = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $argList `
@@ -88,8 +97,27 @@ if ($is64Os) {
 }
 
 $langArg = $Languages -join ','
-Write-Log "Installing Clipboard Voice for languages: $langArg"
+# The DLL's argument, e.g. "clipboard:en,es;prism:en,es" (no spaces, so no quoting for regsvr32).
+$spec = ($kinds | ForEach-Object { "${_}:$langArg" }) -join ';'
+Write-Log "Installing $($kinds -join ' and ') voices for languages: $langArg"
 $errors = 0
+
+function Copy-Replacing([string]$Source, [string]$Dest, [string]$Arch) {
+    try {
+        Copy-Item -LiteralPath $Source -Destination $Dest -Force
+    } catch {
+        if (-not (Test-Path -LiteralPath $Dest)) { throw }
+        # A running program (game, screen reader) has the DLL loaded. Windows allows
+        # renaming a loaded DLL, so move it aside; that program keeps the old one
+        # until it restarts.
+        $aside = "$Dest.$([DateTime]::Now.ToString('yyyyMMddHHmmss')).old"
+        Rename-Item -LiteralPath $Dest -NewName (Split-Path -Leaf $aside)
+        Copy-Item -LiteralPath $Source -Destination $Dest -Force
+        Write-Log "The old $Arch $(Split-Path -Leaf $Dest) is in use; programs using it get the new one after they restart." 'WARN'
+    }
+    Unblock-File -LiteralPath $Dest -ErrorAction SilentlyContinue
+    Write-Log "Copied to $Dest"
+}
 
 foreach ($i in $installs) {
     Write-Log "--- $($i.Arch) ---" ''
@@ -97,33 +125,32 @@ foreach ($i in $installs) {
         Write-Log "$($i.Arch) DLL not found: $($i.Source). Build Release|$($i.Arch -replace 'x86','Win32') first." 'ERROR'
         $errors++; continue
     }
+    $prismSource = Join-Path $prismDir "$($i.Arch)\prism.dll"
+    if ($withPrism -and -not (Test-Path -LiteralPath $prismSource)) {
+        Write-Log "$($i.Arch) prism.dll not found: $prismSource." 'ERROR'
+        $errors++; continue
+    }
     $dest = Join-Path $i.Dir 'ClipboardVoice.dll'
+    $prismDest = Join-Path $i.Dir 'prism.dll'
     try {
         New-Item -ItemType Directory -Force -Path $i.Dir | Out-Null
         # Old copies renamed by a previous install because a program had them loaded.
         Get-ChildItem -LiteralPath $i.Dir -Filter '*.old' -ErrorAction SilentlyContinue |
             Remove-Item -Force -ErrorAction SilentlyContinue
-        try {
-            Copy-Item -LiteralPath $i.Source -Destination $dest -Force
-        } catch {
-            if (-not (Test-Path -LiteralPath $dest)) { throw }
-            # A running program (game, screen reader) has the DLL loaded. Windows allows
-            # renaming a loaded DLL, so move it aside; that program keeps the old one
-            # until it restarts.
-            $aside = "$dest.$([DateTime]::Now.ToString('yyyyMMddHHmmss')).old"
-            Rename-Item -LiteralPath $dest -NewName (Split-Path -Leaf $aside)
-            Copy-Item -LiteralPath $i.Source -Destination $dest -Force
-            Write-Log "The old $($i.Arch) DLL is in use; programs using it get the new one after they restart." 'WARN'
+        Copy-Replacing $i.Source $dest $i.Arch
+        if ($withPrism) {
+            Copy-Replacing $prismSource $prismDest $i.Arch
+            Copy-Item -LiteralPath (Join-Path $prismDir 'LICENSES\prism\mpl-2.0.txt') -Destination (Join-Path $i.Dir 'prism-LICENSE.txt') -Force
+        } else {
+            Remove-Item -LiteralPath $prismDest, (Join-Path $i.Dir 'prism-LICENSE.txt') -Force -ErrorAction SilentlyContinue
         }
-        Unblock-File -LiteralPath $dest -ErrorAction SilentlyContinue
-        Write-Log "Copied to $dest"
     } catch {
-        Write-Log "Could not copy the $($i.Arch) DLL to $($i.Dir): $($_.Exception.Message)" 'ERROR'
+        Write-Log "Could not copy the $($i.Arch) files to $($i.Dir): $($_.Exception.Message)" 'ERROR'
         $errors++; continue
     }
 
-    # /i:<languages> runs DllRegisterServer, then DllInstall which creates one voice per language.
-    $p = Start-Process -FilePath $i.RegSvr -ArgumentList @('/s', "/i:$langArg", "`"$dest`"") -Wait -PassThru -WindowStyle Hidden
+    # /i:<spec> runs DllRegisterServer, then DllInstall which creates one voice per kind and language.
+    $p = Start-Process -FilePath $i.RegSvr -ArgumentList @('/s', "/i:$spec", "`"$dest`"") -Wait -PassThru -WindowStyle Hidden
     if ($p.ExitCode -ne 0) {
         $why = switch ($p.ExitCode) {
             3 { 'the DLL could not be loaded (blocked by antivirus, or wrong architecture?)' }
@@ -137,18 +164,18 @@ foreach ($i in $installs) {
     Write-Log "Registered $($i.Arch) COM class and voices."
 }
 
-# ---- Verify: list and load every Clipboard Voice from each architecture ----
+# ---- Verify: list and load every voice of ours from each architecture ----
 $verify = @'
 $ErrorActionPreference = 'Stop'
 $v = New-Object -ComObject SAPI.SpVoice
 $found = 0
 foreach ($t in $v.GetVoices()) {
-    if ($t.Id -notmatch '\\ClipboardVoice(_[^\\]*)?$') { continue }
+    if ($t.Id -notmatch '\\(ClipboardVoice|Sapi2Prism)(_[^\\]*)?$') { continue }
     $found++
     try {
         $v.Voice = $t
         $v.AudioOutputStream = New-Object -ComObject SAPI.SpMemoryStream
-        # Silence only: runs the engine without touching the clipboard.
+        # Silence only: runs the engine without touching the clipboard or the screen reader.
         [void]$v.Speak('<silence msec="10"/>', 8)
         "OK   " + $t.GetDescription() + "  [Language " + $t.GetAttribute('Language') + "]"
     } catch {
@@ -166,7 +193,7 @@ foreach ($i in $installs) {
         $text = "$line"
         if ($text -like 'FAIL*') { $errors++; Write-Log "$($i.Arch): $text" 'ERROR' } else { Write-Log "$($i.Arch): $text" }
     }
-    $expected = $Languages.Count
+    $expected = $Languages.Count * $kinds.Count
     $ok = @($out | Where-Object { "$_" -like 'OK*' }).Count
     if ($ok -lt $expected) {
         Write-Log "$($i.Arch): expected $expected voice(s), found $ok working." 'ERROR'
@@ -179,6 +206,7 @@ if ($errors) {
     Write-Log "Installation finished with $errors error(s); see above." 'FAIL'
     exit 1
 }
-Write-Log "Clipboard Voice installed for: $langArg" 'SUCCESS'
+Write-Log "$($kinds -join ' and ') voices installed for: $langArg" 'SUCCESS'
 Write-Log 'Test it with: powershell -ExecutionPolicy Bypass -File test\say.ps1 "Hello"' ''
+if ($withPrism) { Write-Log 'Sapi2Prism: powershell -ExecutionPolicy Bypass -File test\say.ps1 "Hello" -Voice Sapi2Prism' '' }
 exit 0

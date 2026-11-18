@@ -60,6 +60,18 @@ typedef struct ClipboardVoiceEngine ClipboardVoiceEngine;
 #endif 	/* __ClipboardVoiceEngine_FWD_DEFINED__ */
 
 
+#ifndef __PrismVoiceEngine_FWD_DEFINED__
+#define __PrismVoiceEngine_FWD_DEFINED__
+
+#ifdef __cplusplus
+typedef class PrismVoiceEngine PrismVoiceEngine;
+#else
+typedef struct PrismVoiceEngine PrismVoiceEngine;
+#endif /* __cplusplus */
+
+#endif 	/* __PrismVoiceEngine_FWD_DEFINED__ */
+
+
 /* header files for imported files */
 #include "oaidl.h"
 #include "ocidl.h"
@@ -85,6 +97,14 @@ EXTERN_C const CLSID CLSID_ClipboardVoiceEngine;
 
 class DECLSPEC_UUID("F4ABF2E3-9F21-4B8C-B410-4A0A9E5C5BD3")
 ClipboardVoiceEngine;
+#endif
+
+EXTERN_C const CLSID CLSID_PrismVoiceEngine;
+
+#ifdef __cplusplus
+
+class DECLSPEC_UUID("8D3B6C1E-2F47-4A5D-9B0E-6C1F2A7D4E95")
+PrismVoiceEngine;
 #endif
 #endif /* __ClipboardVoiceLib_LIBRARY_DEFINED__ */
 

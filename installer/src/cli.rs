@@ -3,11 +3,12 @@
 
 use std::io::{self, BufRead, Write};
 
-use crate::core;
+use crate::core::{self, Output};
 
 pub enum Action {
     Menu,
-    Install(Vec<String>),
+    /// Languages, and which voices (`None`: keep the installed choice, else Clipboard Voice).
+    Install(Vec<String>, Option<Output>),
     Uninstall,
     List,
 }
@@ -16,7 +17,10 @@ pub enum Action {
 pub fn run(action: Action, out: &mut dyn FnMut(&str)) -> i32 {
     out(&format!("=== Clipboard Voice installer {} ===", core::VERSION));
     match action {
-        Action::Install(codes) => report(core::install(&codes, out).map(|_| ()), out),
+        Action::Install(codes, output) => {
+            let output = output.or_else(core::installed_output).unwrap_or(Output::Clipboard);
+            report(core::install(&codes, output, out).map(|_| ()), out)
+        }
         Action::Uninstall => report(core::uninstall(out), out),
         Action::List => {
             for l in core::all_languages() {
@@ -68,7 +72,7 @@ fn menu(out: &mut dyn FnMut(&str)) -> i32 {
         out("");
         show_status(out);
         out("");
-        out("  1. Install, or change languages");
+        out("  1. Install, or change voices and languages");
         out("  2. Search the language list");
         out("  3. Uninstall");
         out("  4. Exit");
@@ -76,13 +80,32 @@ fn menu(out: &mut dyn FnMut(&str)) -> i32 {
         out("");
         match choice.as_str() {
             "1" => {
-                let current: Vec<String> = core::installed_voices().into_iter().map(|v| v.code).collect();
+                let current_output = core::installed_output().unwrap_or(Output::Clipboard);
+                out("Which voices?");
+                for (i, o) in Output::ALL.iter().enumerate() {
+                    out(&format!("  {}. {}", i + 1, o.describe()));
+                }
+                let default_n = Output::ALL.iter().position(|&o| o == current_output).unwrap_or(0) + 1;
+                let Some(line) = prompt(&format!("Voices (1-{}) [{default_n}]: ", Output::ALL.len())) else { return 0 };
+                let output = if line.is_empty() {
+                    current_output
+                } else {
+                    match line.parse::<usize>().ok().and_then(|n| n.checked_sub(1)).and_then(|i| Output::ALL.get(i)) {
+                        Some(&o) => o,
+                        None => {
+                            out("Invalid choice.");
+                            continue;
+                        }
+                    }
+                };
+
+                let current = core::installed_codes();
                 let hint = if current.is_empty() { "en".to_string() } else { current.join(",") };
                 out("Type the language codes separated by commas, for example: en,es or en-GB,es-MX,fr");
                 let Some(line) = prompt(&format!("Languages [{hint}]: ")) else { return 0 };
                 let line = if line.is_empty() { hint } else { line };
                 let codes: Vec<String> = line.split([',', ';', ' ']).filter(|s| !s.is_empty()).map(String::from).collect();
-                report(core::install(&codes, out).map(|_| ()), out);
+                report(core::install(&codes, output, out).map(|_| ()), out);
             }
             "2" => {
                 let Some(q) = prompt("Search for (name or code): ") else { return 0 };
@@ -96,7 +119,7 @@ fn menu(out: &mut dyn FnMut(&str)) -> i32 {
                 }
             }
             "3" => {
-                let Some(yes) = prompt("Remove Clipboard Voice and all its voices? (y/N): ") else { return 0 };
+                let Some(yes) = prompt("Remove Clipboard Voice, Sapi2Prism and all their voices? (y/N): ") else { return 0 };
                 if yes.eq_ignore_ascii_case("y") || yes.eq_ignore_ascii_case("yes") {
                     report(core::uninstall(out), out);
                 }

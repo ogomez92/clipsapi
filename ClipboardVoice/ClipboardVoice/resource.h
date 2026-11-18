@@ -5,4 +5,5 @@
 #define IDS_PROJNAME                    100
 #define IDR_CLIPBOARDVOICE              101
 #define IDR_CLIPBOARDVOICEENGINE        102
+#define IDR_PRISMVOICEENGINE            103
 

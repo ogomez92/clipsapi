@@ -1,9 +1,11 @@
 //! Install / uninstall logic shared by the GUI and the CLI.
 //!
-//! The installer carries both engine DLLs. Installing copies them to
-//! Program Files, registers them with regsvr32 (`/i:<languages>` makes the DLL
-//! create one SAPI voice per language), copies this exe next to them and adds an
-//! entry to Settings > Apps so the voice can be changed or removed later.
+//! The installer carries both engine DLLs and, for the Sapi2Prism voices,
+//! Prism's prism.dll for each architecture. Installing copies them to Program
+//! Files, registers them with regsvr32 (`/i:clipboard:<languages>;prism:<languages>`
+//! makes the DLL create one SAPI voice per kind and language), copies this exe
+//! next to them and adds an entry to Settings > Apps so the voices can be changed
+//! or removed later.
 
 use std::fs;
 use std::os::windows::process::CommandExt;
@@ -17,13 +19,119 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static DLL_X64: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../ClipboardVoice/x64/Release/ClipboardVoice.dll"));
 static DLL_X86: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../ClipboardVoice/x86/Release/ClipboardVoice.dll"));
+// Prism (MPL-2.0) speaks through the screen reader for the Sapi2Prism voices.
+static PRISM_X64: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../vendor/prism/x64/prism.dll"));
+static PRISM_X86: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../vendor/prism/x86/prism.dll"));
+static PRISM_LICENSE: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../vendor/prism/LICENSES/prism/mpl-2.0.txt"));
+const PRISM_DLL: &str = "prism.dll";
+const PRISM_LICENSE_FILE: &str = "prism-LICENSE.txt";
 
 const TOKENS_KEY: &str = r"SOFTWARE\Microsoft\Speech\Voices\Tokens";
-const TOKEN_PREFIX: &str = "ClipboardVoice";
 const UNINSTALL_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\ClipboardVoice";
-const CLSID: &str = "{F4ABF2E3-9F21-4B8C-B410-4A0A9E5C5BD3}";
 const EXE_NAME: &str = "ClipboardVoiceInstaller.exe";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+// ---------- Kinds of voice ----------
+
+/// The two voices the DLL provides (mirrors Registration.cpp in the DLL).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoiceKind {
+    /// Clipboard Voice: puts the text on the clipboard.
+    Clipboard,
+    /// Sapi2Prism: speaks through the running screen reader.
+    Prism,
+}
+
+impl VoiceKind {
+    pub const ALL: [VoiceKind; 2] = [VoiceKind::Clipboard, VoiceKind::Prism];
+
+    /// Registry key prefix of its voice tokens.
+    fn prefix(self) -> &'static str {
+        match self {
+            VoiceKind::Clipboard => "ClipboardVoice",
+            VoiceKind::Prism => "Sapi2Prism",
+        }
+    }
+
+    /// Name in the DLL's `/i:` argument ("clipboard:en prism:en").
+    fn spec_name(self) -> &'static str {
+        match self {
+            VoiceKind::Clipboard => "clipboard",
+            VoiceKind::Prism => "prism",
+        }
+    }
+
+    fn clsid(self) -> &'static str {
+        match self {
+            VoiceKind::Clipboard => "{F4ABF2E3-9F21-4B8C-B410-4A0A9E5C5BD3}",
+            VoiceKind::Prism => "{8D3B6C1E-2F47-4A5D-9B0E-6C1F2A7D4E95}",
+        }
+    }
+
+    fn prog_id(self) -> &'static str {
+        match self {
+            VoiceKind::Clipboard => "ClipboardVoice.Engine",
+            VoiceKind::Prism => "Sapi2Prism.Engine",
+        }
+    }
+
+    /// The kind whose token key this is: "<prefix>" or "<prefix>_<code>".
+    fn of_token(key: &str) -> Option<VoiceKind> {
+        VoiceKind::ALL.into_iter().find(|k| {
+            let p = k.prefix();
+            let n = p.len();
+            match key.get(..n) {
+                Some(head) if head.eq_ignore_ascii_case(p) => key.len() == n || (key.as_bytes()[n] == b'_' && key.len() > n + 1),
+                _ => false,
+            }
+        })
+    }
+}
+
+/// Which voices to install.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Output {
+    Clipboard,
+    Prism,
+    Both,
+}
+
+impl Output {
+    pub const ALL: [Output; 3] = [Output::Clipboard, Output::Prism, Output::Both];
+
+    pub fn kinds(self) -> &'static [VoiceKind] {
+        match self {
+            Output::Clipboard => &[VoiceKind::Clipboard],
+            Output::Prism => &[VoiceKind::Prism],
+            Output::Both => &[VoiceKind::Clipboard, VoiceKind::Prism],
+        }
+    }
+
+    pub fn has(self, kind: VoiceKind) -> bool {
+        self.kinds().contains(&kind)
+    }
+
+    /// "clipboard", "prism" or "both" (the CLI's `--output` values).
+    pub fn code(self) -> &'static str {
+        match self {
+            Output::Clipboard => "clipboard",
+            Output::Prism => "prism",
+            Output::Both => "both",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Output> {
+        Output::ALL.into_iter().find(|o| o.code().eq_ignore_ascii_case(s.trim()))
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Output::Clipboard => "Clipboard Voice (puts the text on the clipboard)",
+            Output::Prism => "Sapi2Prism (speaks through your screen reader: NVDA, JAWS, Narrator...)",
+            Output::Both => "Both Clipboard Voice and Sapi2Prism",
+        }
+    }
+}
 
 // ---------- Languages ----------
 
@@ -142,19 +250,21 @@ pub fn all_languages() -> Vec<Language> {
 }
 
 /// Registry key the DLL uses for a language (mirrors ResolveVoiceLanguage in the DLL).
-fn token_key_for(code: &str) -> Option<String> {
+fn token_key_for(kind: VoiceKind, code: &str) -> Option<String> {
     let specific = resolve_specific(code)?;
+    let prefix = kind.prefix();
     if specific.eq_ignore_ascii_case("en-US") {
-        Some(TOKEN_PREFIX.to_string())
+        Some(prefix.to_string())
     } else {
         let id = if code.contains('-') { specific } else { code.to_string() };
-        Some(format!("{TOKEN_PREFIX}_{}", id.to_lowercase()))
+        Some(format!("{prefix}_{}", id.to_lowercase()))
     }
 }
 
 // ---------- Current state ----------
 
 pub struct InstalledVoice {
+    pub kind: VoiceKind,
     /// Language code as given at install time ("en" for the original English voice).
     pub code: String,
     /// Voice name as SAPI programs list it.
@@ -172,38 +282,55 @@ fn token_names(view: u32) -> Vec<String> {
     tokens
         .enum_keys()
         .filter_map(Result::ok)
-        .filter(|k| is_our_token(k))
+        .filter(|k| VoiceKind::of_token(k).is_some())
         .collect()
-}
-
-/// "ClipboardVoice" or "ClipboardVoice_<code>" (same rule as the DLL).
-fn is_our_token(key: &str) -> bool {
-    let n = TOKEN_PREFIX.len();
-    match key.get(..n) {
-        Some(head) if head.eq_ignore_ascii_case(TOKEN_PREFIX) => key.len() == n || (key.as_bytes()[n] == b'_' && key.len() > n + 1),
-        _ => false,
-    }
 }
 
 /// Voices currently installed (as seen by 64-bit programs).
 pub fn installed_voices() -> Vec<InstalledVoice> {
     let mut voices: Vec<InstalledVoice> = token_names(KEY_WOW64_64KEY)
         .into_iter()
-        .map(|key| {
+        .filter_map(|key| {
+            let kind = VoiceKind::of_token(&key)?;
             let name = hklm()
                 .open_subkey_with_flags(format!(r"{TOKENS_KEY}\{key}"), KEY_READ | KEY_WOW64_64KEY)
                 .and_then(|k| k.get_value::<String, _>(""))
                 .unwrap_or_else(|_| key.clone());
-            let code = if key.eq_ignore_ascii_case(TOKEN_PREFIX) {
+            let prefix = kind.prefix();
+            let code = if key.eq_ignore_ascii_case(prefix) {
                 "en".to_string()
             } else {
-                normalise_case(&key[TOKEN_PREFIX.len() + 1..])
+                normalise_case(&key[prefix.len() + 1..])
             };
-            InstalledVoice { code, name }
+            Some(InstalledVoice { kind, code, name })
         })
         .collect();
     voices.sort_by(|a, b| a.name.cmp(&b.name));
     voices
+}
+
+/// The voices installed now, as an output choice (`None` when nothing is installed).
+pub fn installed_output() -> Option<Output> {
+    let voices = installed_voices();
+    let clip = voices.iter().any(|v| v.kind == VoiceKind::Clipboard);
+    let prism = voices.iter().any(|v| v.kind == VoiceKind::Prism);
+    match (clip, prism) {
+        (true, true) => Some(Output::Both),
+        (true, false) => Some(Output::Clipboard),
+        (false, true) => Some(Output::Prism),
+        (false, false) => None,
+    }
+}
+
+/// Languages installed now, each once whatever its kinds.
+pub fn installed_codes() -> Vec<String> {
+    let mut codes: Vec<String> = Vec::new();
+    for v in installed_voices() {
+        if !codes.iter().any(|c| c.eq_ignore_ascii_case(&v.code)) {
+            codes.push(v.code);
+        }
+    }
+    codes
 }
 
 /// "es-mx" -> "es-MX" (Windows' spelling), "es" stays "es".
@@ -227,6 +354,7 @@ struct Target {
     dir: PathBuf,
     regsvr32: PathBuf,
     dll: &'static [u8],
+    prism: &'static [u8],
     view: u32,
 }
 
@@ -235,8 +363,8 @@ fn targets() -> Vec<Target> {
     let pf64 = PathBuf::from(std::env::var_os("ProgramW6432").or_else(|| std::env::var_os("ProgramFiles")).unwrap_or_else(|| r"C:\Program Files".into()));
     let pf32 = PathBuf::from(std::env::var_os("ProgramFiles(x86)").unwrap_or_else(|| r"C:\Program Files (x86)".into()));
     vec![
-        Target { arch: "64-bit", dir: pf64.join("ClipboardVoice"), regsvr32: windir.join(r"System32\regsvr32.exe"), dll: DLL_X64, view: KEY_WOW64_64KEY },
-        Target { arch: "32-bit", dir: pf32.join("ClipboardVoice"), regsvr32: windir.join(r"SysWOW64\regsvr32.exe"), dll: DLL_X86, view: KEY_WOW64_32KEY },
+        Target { arch: "64-bit", dir: pf64.join("ClipboardVoice"), regsvr32: windir.join(r"System32\regsvr32.exe"), dll: DLL_X64, prism: PRISM_X64, view: KEY_WOW64_64KEY },
+        Target { arch: "32-bit", dir: pf32.join("ClipboardVoice"), regsvr32: windir.join(r"SysWOW64\regsvr32.exe"), dll: DLL_X86, prism: PRISM_X86, view: KEY_WOW64_32KEY },
     ]
 }
 
@@ -290,8 +418,8 @@ fn regsvr32(t: &Target, args: &[&str]) -> Result<(), String> {
     }
 }
 
-/// Installs (or reconfigures) Clipboard Voice with exactly these languages.
-pub fn install(codes: &[String], log: &mut dyn FnMut(&str)) -> Result<Vec<InstalledVoice>, String> {
+/// Installs (or reconfigures) the chosen voices with exactly these languages.
+pub fn install(codes: &[String], output: Output, log: &mut dyn FnMut(&str)) -> Result<Vec<InstalledVoice>, String> {
     let mut langs: Vec<String> = Vec::new();
     for c in codes {
         let v = validate_code(c)?;
@@ -303,20 +431,33 @@ pub fn install(codes: &[String], log: &mut dyn FnMut(&str)) -> Result<Vec<Instal
         return Err("choose at least one language".into());
     }
     let lang_arg = langs.join(",");
-    log(&format!("Installing Clipboard Voice {VERSION} for: {lang_arg}"));
+    // The DLL's argument, e.g. "clipboard:en,es;prism:en,es" (no spaces, so no quoting for regsvr32).
+    let spec = output.kinds().iter().map(|k| format!("{}:{lang_arg}", k.spec_name())).collect::<Vec<_>>().join(";");
+    let with_prism = output.has(VoiceKind::Prism);
+    log(&format!("Installing {} {VERSION} for: {lang_arg}", output.describe()));
 
     for t in targets() {
         fs::create_dir_all(&t.dir).map_err(|e| format!("could not create {}: {e}", t.dir.display()))?;
         remove_old_copies(&t.dir);
         let dll = t.dir.join("ClipboardVoice.dll");
         write_replacing(&dll, t.dll, log)?;
+        let prism = t.dir.join(PRISM_DLL);
+        if with_prism {
+            write_replacing(&prism, t.prism, log)?;
+            write_replacing(&t.dir.join(PRISM_LICENSE_FILE), PRISM_LICENSE, log)?;
+        } else {
+            // Not needed any more; a program that still has it loaded keeps it until it exits.
+            let _ = fs::remove_file(&prism);
+            let _ = fs::remove_file(t.dir.join(PRISM_LICENSE_FILE));
+        }
         let dll_s = dll.to_string_lossy().to_string();
-        regsvr32(&t, &["/s", &format!("/i:{lang_arg}"), &dll_s])?;
-        log(&format!("Registered the {} voice in {}.", t.arch, t.dir.display()));
+        regsvr32(&t, &["/s", &format!("/i:{spec}"), &dll_s])?;
+        log(&format!("Registered the {} voices in {}.", t.arch, t.dir.display()));
     }
 
     // Check the voices exist for both 64-bit and 32-bit programs.
-    let mut expected: Vec<String> = langs.iter().filter_map(|l| token_key_for(l)).collect();
+    let mut expected: Vec<String> =
+        output.kinds().iter().flat_map(|&k| langs.iter().filter_map(move |l| token_key_for(k, l))).collect();
     expected.sort();
     expected.dedup();
     for t in targets() {
@@ -363,7 +504,13 @@ fn register_uninstaller(log: &mut dyn FnMut(&str)) -> Result<(), String> {
     set("QuietUninstallString", &format!("\"{exe_s}\" --cli --uninstall"))?;
     set("ModifyPath", &format!("\"{exe_s}\""))?;
     key.set_value("NoRepair", &1u32).map_err(|e| e.to_string())?;
-    let size_kb = ((DLL_X64.len() + DLL_X86.len()) as u64 + fs::metadata(&exe).map(|m| m.len()).unwrap_or(0)) / 1024;
+    let files: u64 = targets()
+        .iter()
+        .flat_map(|t| ["ClipboardVoice.dll", PRISM_DLL, PRISM_LICENSE_FILE].map(|f| t.dir.join(f)))
+        .filter_map(|p| fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    let size_kb = (files + fs::metadata(&exe).map(|m| m.len()).unwrap_or(0)) / 1024;
     key.set_value("EstimatedSize", &(size_kb as u32)).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -379,7 +526,7 @@ pub fn uninstall(log: &mut dyn FnMut(&str)) -> Result<(), String> {
         if dll.exists() {
             let dll_s = dll.to_string_lossy().to_string();
             match regsvr32(&t, &["/s", "/u", &dll_s]) {
-                Ok(()) => log(&format!("Unregistered the {} voice.", t.arch)),
+                Ok(()) => log(&format!("Unregistered the {} voices.", t.arch)),
                 Err(e) => log(&format!("Warning: {e}; cleaning the registry directly.")),
             }
         }
@@ -393,8 +540,10 @@ pub fn uninstall(log: &mut dyn FnMut(&str)) -> Result<(), String> {
             }
         }
         if let Ok(classes) = root.open_subkey_with_flags(r"SOFTWARE\Classes", KEY_ALL_ACCESS | t.view) {
-            let _ = classes.delete_subkey_all(format!(r"CLSID\{CLSID}"));
-            let _ = classes.delete_subkey_all("ClipboardVoice.Engine");
+            for kind in VoiceKind::ALL {
+                let _ = classes.delete_subkey_all(format!(r"CLSID\{}", kind.clsid()));
+                let _ = classes.delete_subkey_all(kind.prog_id());
+            }
         }
 
         if t.dir.exists() {
