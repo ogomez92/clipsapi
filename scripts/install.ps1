@@ -16,7 +16,7 @@
 #>
 [CmdletBinding()]
 param(
-    # Locale names: en, es, fr, es-MX, ... "en" keeps the original "Clipboard Voice" name.
+    # Locale names: en, es, fr, es-MX, ... "en" keeps the original token key ("ClipboardVoice").
     [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
     [string[]]$Languages = @('en'),
     # clipboard: Clipboard Voice; prism: Sapi2Prism; both.
@@ -208,5 +208,5 @@ if ($errors) {
 }
 Write-Log "$($kinds -join ' and ') voices installed for: $langArg" 'SUCCESS'
 Write-Log 'Test it with: powershell -ExecutionPolicy Bypass -File test\say.ps1 "Hello"' ''
-if ($withPrism) { Write-Log 'Sapi2Prism: powershell -ExecutionPolicy Bypass -File test\say.ps1 "Hello" -Voice Sapi2Prism' '' }
+if ($withPrism) { Write-Log 'Sapi2Prism: powershell -ExecutionPolicy Bypass -File test\say.ps1 "Hello" -Voice "Sapi2Prism (English)"' '' }
 exit 0

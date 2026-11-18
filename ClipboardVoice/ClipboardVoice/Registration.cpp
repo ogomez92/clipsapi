@@ -1,10 +1,12 @@
 // ---------- SAPI voice token registration ----------
 //
 // One token per language and kind of voice. Clipboard Voice in English (en-US)
-// keeps the original key and name ("ClipboardVoice" / "Clipboard Voice") so
-// existing setups keep working; other languages get "ClipboardVoice_<locale>" /
-// "Clipboard Voice (<Language>)". Sapi2Prism voices follow the same rule with
-// "Sapi2Prism" / "Sapi2Prism (<Language>)".
+// keeps the original key ("ClipboardVoice") so programs that saved the token
+// keep working; other languages get "ClipboardVoice_<locale>". Every voice is
+// named "Clipboard Voice (<Language>)", English included: System.Speech's
+// SelectVoice("X (Spanish)") takes an installed voice named plain "X" listed
+// before it as the match and then fails, so no name may be a word-prefix of
+// another. Sapi2Prism voices follow the same rule with "Sapi2Prism".
 
 #include "ClipboardVoiceEngine.h"
 #include <cwctype>
@@ -59,7 +61,7 @@ static HRESULT ResolveVoiceLanguage(const VoiceKind& kind, const std::wstring& r
     if (_wcsicmp(specific, L"en-US") == 0)
     {
         out.keyName = kind.prefix;
-        out.name = kind.name;
+        out.name = std::wstring(kind.name) + L" (English)";
         return S_OK;
     }
 

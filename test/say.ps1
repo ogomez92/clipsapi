@@ -1,7 +1,7 @@
 param(
     [string]$Text = "Hello from Clipboard Voice. If this text is spoken by another voice, clipboard voice did not work. If this text is in your clipboard, it worked!",
     # Exact voice name, e.g. "Clipboard Voice (Spanish)".
-    [string]$Voice = "Clipboard Voice"
+    [string]$Voice = "Clipboard Voice (English)"
 )
 
 $v = New-Object -ComObject SAPI.SpVoice

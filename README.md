@@ -6,7 +6,7 @@ Clipboard Voice is a minimal SAPI 5 TTS engine that writes the spoken text to th
 
 The same DLL also provides **Sapi2Prism**, a SAPI 5 voice that sends the text to your screen reader through [Prism](https://github.com/ethindp/prism) instead. It finds the running screen reader by itself (NVDA, JAWS, ZDSR, PC-Talker, Boy PC Reader, ZoomText, Narrator through UI Automation, and others), so a program that only knows SAPI talks through NVDA like a screen-reader-aware game would. You can install Clipboard Voice, Sapi2Prism or both.
 
-It can register one voice per language, so programs that pick a voice by language (for example a Spanish game looking for a Spanish voice) find one. English keeps the original name, **Clipboard Voice** (or **Sapi2Prism**); other languages are called **Clipboard Voice (Spanish)**, **Sapi2Prism (French)**, and so on. Any language Windows knows that has a Windows language ID can be used, including regional variants such as `es-MX` or `en-GB`.
+It can register one voice per language, so programs that pick a voice by language (for example a Spanish game looking for a Spanish voice) find one. Voices are called **Clipboard Voice (English)**, **Clipboard Voice (Spanish)**, **Sapi2Prism (French)**, and so on. (Up to 1.1.0 the English ones were plain **Clipboard Voice** and **Sapi2Prism**; programs using .NET's System.Speech, such as Unity games with RT-Voice, then couldn't select the other languages of the same kind. Programs that saved the old English name need the voice picked again.) Any language Windows knows that has a Windows language ID can be used, including regional variants such as `es-MX` or `en-GB`.
 
 ## Install
 
@@ -69,7 +69,8 @@ The text should be on the clipboard afterward. For Sapi2Prism, `test\say.ps1 "He
 ## How It Works
 
 - `ISpTTSEngine::Speak` joins the text fragments and a background thread writes them to the clipboard as UTF‑16, retrying while another program has the clipboard open. Empty or blank requests leave the clipboard alone.
-- Each word and each whitespace character produces 20 ms of silence, and every utterance lasts at least one second, because some programs (Jim Kitchen's games, for example) need speech to take time. Word, sentence and bookmark events are raised against the caller's text as SAPI expects.
+- Each word and each whitespace character takes 20 ms, and every utterance lasts at least one second, because some programs (Jim Kitchen's games, for example) need speech to take time. Word, sentence and bookmark events are raised against the caller's text as SAPI expects, in real time.
+- No audio is produced at all, not even silence: the time passes inside `Speak`. Programs that render speech to a file and replay the file when the same text comes again would otherwise never ask the voice for a repeated text; RT-Voice (Unity games) does this with any file over 1 KB, and an empty one is never kept.
 - If the program interrupts speech (purge/abort), text still waiting for the clipboard is dropped; the next text is written normally.
 - Each voice token declares its language (for example `C0A;A` for Spanish) and points at its engine: one COM class for Clipboard Voice and one for Sapi2Prism, both in `ClipboardVoice.dll`.
 
@@ -78,7 +79,7 @@ The text should be on the clipboard afterward. For Sapi2Prism, `test\say.ps1 "He
 - The text goes to the screen reader that is running, through `prism.dll` (loaded on first use from the folder of `ClipboardVoice.dll`). It looks again for a screen reader at most once a second, so starting, closing or switching screen readers while a program runs works, and it reconnects when NVDA is restarted. Braille displays get the text too.
 - Prism's own voices (SAPI, OneCore) are never used, so with no screen reader running the voice stays silent instead of talking over nothing (or calling itself).
 - Interrupting: when a program cuts speech (purge), the screen reader is stopped. SAPI does not tell an engine about purges directly, so a text that arrives right after the previous one finished is queued after it (the next item of SAPI's queue), and any other text interrupts what the screen reader is saying. An empty purge request stops the screen reader.
-- With screen readers that report whether they are speaking (current NVDA), each utterance lasts as long as the screen reader really speaks it, so programs that wait for speech to end (`WaitUntilDone`, synchronous `Speak`, end-of-stream events) wait the right time. With others (JAWS, Narrator, ...) the pacing is the same as Clipboard Voice's.
+- Each text is handed to the screen reader as soon as it arrives; the voice does not wait for the screen reader to finish speaking it (most can't tell, and NVDA reports short silences in the middle of a text). The pacing is the same as Clipboard Voice's. An utterance never ends before its text has reached the screen reader, so programs that start one process per line and exit when `Speak` returns (Unity games using RT-Voice) don't lose it.
 - Rate, pitch and volume changes from the program are ignored: they would change your screen reader's own settings.
 
 ## Release
@@ -123,7 +124,7 @@ git push origin v1.0.0
 
 - Voice names, vendor and language handling: `ClipboardVoice/ClipboardVoice/Registration.cpp`.
 - Pacing: `kMsPerStep` and `kMinUtteranceMs` in `ClipboardVoiceEngine.cpp`.
-- Sapi2Prism (screen reader choice, interrupting, waiting for the screen reader): `ClipboardVoice/ClipboardVoice/PrismOutput.cpp`.
+- Sapi2Prism (screen reader choice, interrupting, handing the text over): `ClipboardVoice/ClipboardVoice/PrismOutput.cpp`.
 
 ## Caveats
 

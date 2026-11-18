@@ -5,7 +5,7 @@
 // Build (from a VS Developer Command Prompt, x64 or x86):
 //   cl /nologo /EHsc /W4 eventdump.cpp ole32.lib user32.lib
 // Usage:
-//   eventdump "Clipboard Voice" "Hello world. Second sentence."
+//   eventdump "Clipboard Voice (English)" "Hello world. Second sentence."
 //   eventdump "Clipboard Voice (Spanish)" "Hola <bookmark mark=\"7\"/>mundo"
 // Text starting with '<' or containing "<bookmark" is spoken as SAPI XML.
 

@@ -92,16 +92,14 @@ bool CVoiceEngineBase::Aborted(ISpTTSEngineSite* pSite)
 static const double kMsPerStep = 20.0;
 static const double kMinUtteranceMs = 1000.0;
 
-CVoiceEngineBase::CVoiceEngineBase()
-{
-    m_wfx.wFormatTag = WAVE_FORMAT_PCM;
-    m_wfx.nSamplesPerSec = 16000;
-    m_wfx.wBitsPerSample = 16;
-    m_wfx.nChannels = 1;
-    m_wfx.nBlockAlign = (m_wfx.nChannels * m_wfx.wBitsPerSample) / 8;
-    m_wfx.nAvgBytesPerSec = m_wfx.nSamplesPerSec * m_wfx.nBlockAlign;
-    m_wfx.cbSize = 0;
-}
+// The time passes inside Speak (sleeping); no audio is written at all, and
+// every event is raised at audio offset 0. Programs that render speech to a file
+// and replay that file for the same text otherwise never call the voice again,
+// and the text is lost: RT-Voice (Unity games) does that for files over 1 KB.
+// With no audio, SAPI delivers each offset-0 event as soon as it is raised, so
+// events still arrive in real time; with a few samples of audio SAPI held them
+// back until the end of the utterance.
+static const ULONGLONG kEventOffset = 0;
 
 STDMETHODIMP CVoiceEngineBase::SetObjectToken(ISpObjectToken* pToken)
 {
@@ -126,7 +124,7 @@ STDMETHODIMP CVoiceEngineBase::GetOutputFormat(const GUID* /*pTargetFormatId*/, 
     return *ppCoMemDesiredWaveFormatEx ? S_OK : E_OUTOFMEMORY;
 }
 
-STDMETHODIMP CVoiceEngineBase::Speak(DWORD dwFlags, REFGUID /*rguidFormatId*/, const WAVEFORMATEX* pWaveFormatEx,
+STDMETHODIMP CVoiceEngineBase::Speak(DWORD dwFlags, REFGUID /*rguidFormatId*/, const WAVEFORMATEX* /*pWaveFormatEx*/,
                                           const SPVTEXTFRAG* pTextFragList, ISpTTSEngineSite* pOutputSite)
 {
     if (!pOutputSite || !pTextFragList) return E_INVALIDARG;
@@ -141,10 +139,6 @@ STDMETHODIMP CVoiceEngineBase::Speak(DWORD dwFlags, REFGUID /*rguidFormatId*/, c
         return S_OK;
     }
 
-    const WAVEFORMATEX* fmt = (pWaveFormatEx && pWaveFormatEx->wFormatTag == WAVE_FORMAT_PCM &&
-                               pWaveFormatEx->nAvgBytesPerSec && pWaveFormatEx->nBlockAlign)
-                                  ? pWaveFormatEx : &m_wfx;
-
     const SpeechInput input = BuildInput(pTextFragList);
     OnText(input.text, (dwFlags & SPF_PURGEBEFORESPEAK) != 0);
 
@@ -154,16 +148,39 @@ STDMETHODIMP CVoiceEngineBase::Speak(DWORD dwFlags, REFGUID /*rguidFormatId*/, c
         return S_OK;
     };
 
-    ULONGLONG audioBytes = 0;
-    if (!EmitProgress(input, pOutputSite, fmt, audioBytes)) return aborted();
-    if (!HoldWhileBusy(input.text, pOutputSite, fmt, audioBytes)) return aborted();
-
-    const ULONGLONG minBytes = (ULONGLONG)(fmt->nAvgBytesPerSec * (kMinUtteranceMs / 1000.0));
-    if (audioBytes < minBytes &&
-        !WriteSilence(pOutputSite, fmt, (size_t)(minBytes - audioBytes), audioBytes))
-        return aborted();
+    Pacer pacer(pOutputSite);
+    if (!EmitProgress(input, pOutputSite, pacer)) return aborted();
+    if (!WaitForOutput(input.text, pOutputSite)) return aborted();
+    if (!pacer.WaitUntil(kMinUtteranceMs)) return aborted();
     OnDone(true);
     return S_OK;
+}
+
+// ---------- Pacer ----------
+
+CVoiceEngineBase::Pacer::Pacer(ISpTTSEngineSite* pSite)
+    : m_site(pSite)
+    , m_start(::GetTickCount64())
+{
+}
+
+bool CVoiceEngineBase::Pacer::WaitUntil(double ms)
+{
+    // Against the start time, so oversleeping (timer granularity) doesn't add up.
+    for (;;)
+    {
+        if (Aborted(m_site)) return false;
+        const double now = (double)(::GetTickCount64() - m_start);
+        if (now >= ms) return true;
+        const double left = ms - now;
+        ::Sleep((DWORD)(left < 1.0 ? 1.0 : (left < 10.0 ? left : 10.0))); // notice an abort quickly
+    }
+}
+
+bool CVoiceEngineBase::Pacer::Step(double ms)
+{
+    m_target += ms;
+    return WaitUntil(m_target);
 }
 
 // ---------- Clipboard Voice ----------
@@ -291,37 +308,9 @@ void CVoiceEngineBase::AddEvent(ISpTTSEngineSite* pSite, SPEVENTENUM evtId, ULON
 }
 
 // static
-bool CVoiceEngineBase::WriteSilence(ISpTTSEngineSite* pSite, const WAVEFORMATEX* pFmt,
-                                         size_t bytes, ULONGLONG& audioBytes)
-{
-    const size_t align = pFmt->nBlockAlign ? pFmt->nBlockAlign : 1;
-    bytes = (bytes / align) * align;
-    // Write in ~10 ms chunks so an abort is noticed quickly.
-    size_t chunk = ((size_t)(pFmt->nAvgBytesPerSec / 100) / align) * align;
-    if (chunk == 0) chunk = align;
-    static const BYTE kZeros[4096] = {};
-    if (chunk > sizeof(kZeros)) chunk = (sizeof(kZeros) / align) * align;
-
-    size_t sent = 0;
-    while (sent < bytes)
-    {
-        if (Aborted(pSite)) return false;
-        const ULONG toWrite = (ULONG)((bytes - sent < chunk) ? (bytes - sent) : chunk);
-        ULONG wrote = 0;
-        if (FAILED(pSite->Write(kZeros, toWrite, &wrote)) || wrote == 0)
-            break; // output gone; nothing more to do
-        sent += wrote;
-        audioBytes += wrote;
-    }
-    return !Aborted(pSite);
-}
-
-// static
-bool CVoiceEngineBase::EmitProgress(const SpeechInput& in, ISpTTSEngineSite* pSite,
-                                         const WAVEFORMATEX* pFmt, ULONGLONG& audioBytes)
+bool CVoiceEngineBase::EmitProgress(const SpeechInput& in, ISpTTSEngineSite* pSite, Pacer& pacer)
 {
     const std::wstring& text = in.text;
-    const size_t stepBytes = (size_t)(pFmt->nAvgBytesPerSec * (kMsPerStep / 1000.0));
     size_t nextBookmark = 0;
 
     auto emitBookmarksUpTo = [&](size_t pos) {
@@ -329,7 +318,7 @@ bool CVoiceEngineBase::EmitProgress(const SpeechInput& in, ISpTTSEngineSite* pSi
         {
             const std::wstring& name = in.bookmarks[nextBookmark].name;
             // SAPI copies the string; wParam carries the numeric value as SAPI's own engines do.
-            AddEvent(pSite, SPEI_TTS_BOOKMARK, audioBytes, (WPARAM)_wtol(name.c_str()),
+            AddEvent(pSite, SPEI_TTS_BOOKMARK, kEventOffset, (WPARAM)_wtol(name.c_str()),
                      (LPARAM)name.c_str(), SPET_LPARAM_IS_STRING);
         }
     };
@@ -353,7 +342,7 @@ bool CVoiceEngineBase::EmitProgress(const SpeechInput& in, ISpTTSEngineSite* pSi
 
         if (IsWhitespace(text[i]))
         {
-            if (!WriteSilence(pSite, pFmt, stepBytes, audioBytes)) return false;
+            if (!pacer.Step(kMsPerStep)) return false;
             ++i;
             continue;
         }
@@ -373,13 +362,13 @@ bool CVoiceEngineBase::EmitProgress(const SpeechInput& in, ISpTTSEngineSite* pSi
                 if (j > ws && endsSentence(j, ws)) break;
             }
             // SPEI_SENTENCE_BOUNDARY / SPEI_WORD_BOUNDARY: lParam = position, wParam = length.
-            AddEvent(pSite, SPEI_SENTENCE_BOUNDARY, audioBytes, srcLen(start, end), (LPARAM)in.srcOffset[start]);
+            AddEvent(pSite, SPEI_SENTENCE_BOUNDARY, kEventOffset, srcLen(start, end), (LPARAM)in.srcOffset[start]);
             atSentenceStart = false;
         }
-        AddEvent(pSite, SPEI_WORD_BOUNDARY, audioBytes, srcLen(start, i), (LPARAM)in.srcOffset[start]);
+        AddEvent(pSite, SPEI_WORD_BOUNDARY, kEventOffset, srcLen(start, i), (LPARAM)in.srcOffset[start]);
         if (endsSentence(i, start)) atSentenceStart = true;
 
-        if (!WriteSilence(pSite, pFmt, stepBytes, audioBytes)) return false;
+        if (!pacer.Step(kMsPerStep)) return false;
     }
     emitBookmarksUpTo(SIZE_MAX);
     return true;

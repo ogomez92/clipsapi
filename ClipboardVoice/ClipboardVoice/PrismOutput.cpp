@@ -98,7 +98,6 @@ struct PrismApi
     decltype(&prism_backend_speak) backend_speak = nullptr;
     decltype(&prism_backend_braille) backend_braille = nullptr;
     decltype(&prism_backend_stop) backend_stop = nullptr;
-    decltype(&prism_backend_is_speaking) backend_is_speaking = nullptr;
     decltype(&prism_error_string) error_string = nullptr;
     decltype(&prism_version_string) version_string = nullptr;
 
@@ -121,7 +120,6 @@ struct PrismApi
         get(backend_speak, "prism_backend_speak");
         get(backend_braille, "prism_backend_braille");
         get(backend_stop, "prism_backend_stop");
-        get(backend_is_speaking, "prism_backend_is_speaking");
         get(error_string, "prism_error_string");
         get(version_string, "prism_version_string");
         return ok;
@@ -165,15 +163,18 @@ public:
         Post([this] { DoStop(); });
     }
 
-    // 1 speaking, 0 silent, -1 unknown (no screen reader, or it can't tell, or no answer in time).
-    int IsSpeaking(DWORD timeoutMs)
+    // Waits until every request posted so far has been handled (the text was
+    // handed to the screen reader), checking `stop` every few ms. False when
+    // `stop` returned true or timeoutMs passed first.
+    bool WaitForPending(ULONGLONG timeoutMs, const std::function<bool()>& stop)
     {
-        auto answer = std::make_shared<std::promise<int>>();
-        std::future<int> result = answer->get_future();
-        Post([this, answer] { answer->set_value(DoIsSpeaking()); });
-        if (result.wait_for(std::chrono::milliseconds(timeoutMs)) != std::future_status::ready)
-            return -1;
-        return result.get();
+        auto done = std::make_shared<std::promise<void>>();
+        std::future<void> result = done->get_future();
+        Post([done] { done->set_value(); });
+        const ULONGLONG start = ::GetTickCount64();
+        while (result.wait_for(std::chrono::milliseconds(20)) != std::future_status::ready)
+            if (stop() || ::GetTickCount64() - start >= timeoutMs) return false;
+        return true;
     }
 
 private:
@@ -301,8 +302,7 @@ private:
             m_backend = b;
             m_backendId = id;
             m_features = m_api.backend_get_features(b);
-            Log("speaking through %s%s", m_api.backend_name(b),
-                (m_features & PRISM_BACKEND_SUPPORTS_IS_SPEAKING) ? " (it reports when it is speaking)" : "");
+            Log("speaking through %s", m_api.backend_name(b));
             return;
         }
         if (m_backend) Log("%s is no longer running", m_api.backend_name(m_backend));
@@ -336,14 +336,6 @@ private:
         Log("stop: %s", m_api.Err(e));
     }
 
-    int DoIsSpeaking()
-    {
-        if (!m_backend || !(m_features & PRISM_BACKEND_SUPPORTS_IS_SPEAKING)) return -1;
-        bool speaking = false;
-        if (m_api.backend_is_speaking(m_backend, &speaking) != PRISM_OK) return -1;
-        return speaking ? 1 : 0;
-    }
-
     std::once_flag m_startOnce;
     std::mutex m_mutex;
     std::condition_variable m_cv;
@@ -374,13 +366,10 @@ const ULONGLONG kQueuedFollowUpMs = 150;
 std::atomic<ULONGLONG> g_lastDoneTick{ 0 };
 std::atomic<bool> g_lastCompleted{ false };
 
-// Hold the utterance while the screen reader speaks: wait this long for it to
-// start, then poll; never longer than kMaxHoldBaseMs + kMaxHoldPerCharMs per char.
-const ULONGLONG kStartWaitMs = 500;
-const ULONGLONG kPollMs = 50;
-const ULONGLONG kMaxHoldBaseMs = 2000;
-const ULONGLONG kMaxHoldPerCharMs = 120;
-const ULONGLONG kMaxHoldMs = 120000;
+// Longest wait for the text to reach the screen reader before Speak returns,
+// and the wait above which the log says how long it took.
+const ULONGLONG kDeliverMaxMs = 5000;
+const ULONGLONG kDeliverSlowMs = 50;
 
 } // namespace
 
@@ -404,34 +393,26 @@ void CPrismVoiceEngine::OnAbort()
     PrismService::Get().Stop();
 }
 
-bool CPrismVoiceEngine::HoldWhileBusy(const std::wstring& text, ISpTTSEngineSite* pSite,
-                                      const WAVEFORMATEX* pFmt, ULONGLONG& audioBytes)
+bool CPrismVoiceEngine::WaitForOutput(const std::wstring& text, ISpTTSEngineSite* pSite)
 {
     if (IsBlank(text)) return true;
+
+    // Speak must not return before the text reached the screen reader: some
+    // programs (RT-Voice's TTS wrapper) start one process per utterance, render
+    // it to a file in no time and exit as soon as Speak returns, which would end
+    // the Prism thread while it is still loading Prism or talking to the reader.
+    // Whether the screen reader is still speaking is not waited for: most can't
+    // tell, and NVDA reports short silences in the middle of a text.
     const ULONGLONG start = ::GetTickCount64();
-    ULONGLONG maxMs = kMaxHoldBaseMs + kMaxHoldPerCharMs * text.size();
-    if (maxMs > kMaxHoldMs) maxMs = kMaxHoldMs;
-    const size_t chunk = (size_t)(pFmt->nAvgBytesPerSec * kPollMs / 1000);
-    bool started = false;
-    for (;;)
+    if (!PrismService::Get().WaitForPending(kDeliverMaxMs, [&] { return Aborted(pSite); }))
     {
-        const ULONGLONG pollStart = ::GetTickCount64();
-        const int speaking = PrismService::Get().IsSpeaking((DWORD)kPollMs * 4);
-        if (speaking < 0) return true; // the screen reader can't tell: the usual pacing applies
-        const ULONGLONG elapsed = pollStart - start;
-        if (speaking == 1) started = true;
-        if ((speaking == 0 && (started || elapsed >= kStartWaitMs)) || elapsed >= maxMs)
-        {
-            Log("held %llu ms for the screen reader%s", elapsed,
-                started ? "" : " (it never reported speaking)");
-            return true;
-        }
-        if (!WriteSilence(pSite, pFmt, chunk, audioBytes)) return false;
-        // Writes return at once while SAPI buffers audio; poll at a steady pace anyway.
-        const ULONGLONG spent = ::GetTickCount64() - pollStart;
-        if (spent < kPollMs) ::Sleep((DWORD)(kPollMs - spent));
         if (Aborted(pSite)) return false;
+        Log("the screen reader did not take the text within %llu ms", kDeliverMaxMs);
+        return true;
     }
+    const ULONGLONG waited = ::GetTickCount64() - start;
+    if (waited >= kDeliverSlowMs) Log("waited %llu ms for the text to reach the screen reader", waited);
+    return true;
 }
 
 void CPrismVoiceEngine::OnDone(bool completed)

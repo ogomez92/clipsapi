@@ -25,7 +25,6 @@ class CVoiceEngineBase
     , public ISpObjectWithToken
 {
 public:
-    CVoiceEngineBase();
     virtual ~CVoiceEngineBase() = default;
 
     // ISpObjectWithToken
@@ -47,19 +46,33 @@ protected:
     virtual void OnText(const std::wstring& text, bool purge) = 0;
     // SAPI aborted the utterance (the program interrupted speech).
     virtual void OnAbort() = 0;
-    // After the words are paced: keep the utterance going while the output is
-    // still busy (writing silence through WriteSilence). Return false if SAPI aborted.
-    virtual bool HoldWhileBusy(const std::wstring& /*text*/, ISpTTSEngineSite* /*pSite*/,
-                               const WAVEFORMATEX* /*pFmt*/, ULONGLONG& /*audioBytes*/) { return true; }
+    // After the words are paced: wait until the output has taken the text, so
+    // Speak never returns (and the program never exits) with it still unsent.
+    // Return false if SAPI aborted.
+    virtual bool WaitForOutput(const std::wstring& /*text*/, ISpTTSEngineSite* /*pSite*/) { return true; }
     // Speak finished; `completed` is false when it was aborted.
     virtual void OnDone(bool /*completed*/) {}
 
-    // Writes `bytes` of silence in small chunks; false when SAPI asked to abort.
-    static bool WriteSilence(ISpTTSEngineSite* pSite, const WAVEFORMATEX* pFmt,
-                             size_t bytes, ULONGLONG& audioBytes);
     static bool Aborted(ISpTTSEngineSite* pSite);
 
 private:
+    // Paces one utterance in real time inside Speak; no audio is written (see
+    // kEventOffset in the .cpp).
+    class Pacer
+    {
+    public:
+        explicit Pacer(ISpTTSEngineSite* pSite);
+        // Waits `ms` more; false on abort.
+        bool Step(double ms);
+        // Waits until `ms` after the start of the utterance; false on abort.
+        bool WaitUntil(double ms);
+
+    private:
+        ISpTTSEngineSite* m_site;
+        ULONGLONG m_start;
+        double m_target = 0;
+    };
+
     // Text of one Speak call, with what we need to raise events against it.
     struct SpeechInput
     {
@@ -73,13 +86,11 @@ private:
     static SpeechInput BuildInput(const SPVTEXTFRAG* pList);
 
     // Returns false when SAPI asked us to abort.
-    static bool EmitProgress(const SpeechInput& in, ISpTTSEngineSite* pSite,
-                             const WAVEFORMATEX* pFmt, ULONGLONG& audioBytes);
+    static bool EmitProgress(const SpeechInput& in, ISpTTSEngineSite* pSite, Pacer& pacer);
     static void AddEvent(ISpTTSEngineSite* pSite, SPEVENTENUM evtId, ULONGLONG audioOffset,
                          WPARAM wParam, LPARAM lParam, SPEVENTLPARAMTYPE lParamType = SPET_LPARAM_IS_UNDEFINED);
 
     CComPtr<ISpObjectToken> m_cpToken;
-    WAVEFORMATEX m_wfx{};
 };
 
 // Clipboard Voice: writes the spoken text to the clipboard.
@@ -126,8 +137,7 @@ public:
 protected:
     void OnText(const std::wstring& text, bool purge) override;
     void OnAbort() override;
-    bool HoldWhileBusy(const std::wstring& text, ISpTTSEngineSite* pSite,
-                       const WAVEFORMATEX* pFmt, ULONGLONG& audioBytes) override;
+    bool WaitForOutput(const std::wstring& text, ISpTTSEngineSite* pSite) override;
     void OnDone(bool completed) override;
 };
 
